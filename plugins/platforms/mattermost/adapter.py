@@ -642,8 +642,17 @@ class MattermostAdapter(BasePlatformAdapter):
                + (" → твой пост" if not thread_root else " → в твоём треде") + "."
         logger.info("Mattermost: reaction signal %s %s → %s", emitter, emoji, post_id)
         from gateway.platforms.base import MessageEvent, MessageType
-        await self.handle_message(MessageEvent(
-            text=note, message_type=MessageType.TEXT, source=source, internal=True, message_id=post_id))
+        staged = MessageEvent(
+            text=note, message_type=MessageType.TEXT, source=source, internal=True, message_id=post_id)
+        session_key = self._event_session_key(staged)
+        # Passive injection: stage the note as a turn sidecar so it rides the NEXT real user
+        # message (via api_content), reaching the model without spawning its own turn/reply.
+        runner = getattr(self, "gateway_runner", None)
+        _set_notes = getattr(runner, "_set_pending_turn_sidecar_notes", None)
+        if callable(_set_notes):
+            _set_notes(session_key, [note])
+        else:
+            logger.debug("Mattermost: no runner to stage reaction sidecar note (session=%s)", session_key)
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")

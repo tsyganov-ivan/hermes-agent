@@ -710,8 +710,9 @@ class TestMultiplexProfileScope:
             assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
 
 
+
 # ---------------------------------------------------------------------------
-# Reaction reading (read_reactions): WS reaction_added → internal signal
+# Reaction reading (read_reactions): WS reaction_added → passive sidecar note
 # ---------------------------------------------------------------------------
 
 class TestMattermostReadReactions:
@@ -724,79 +725,79 @@ class TestMattermostReadReactions:
         )
         a = MattermostAdapter(config)
         a._bot_user_id = "bot_id"
-        a.handle_message = AsyncMock()
         a._api_get = AsyncMock()
+        # fake gateway runner with the sidecar-staging hook
+        a.gateway_runner = MagicMock()
+        a.gateway_runner._set_pending_turn_sidecar_notes = MagicMock()
         return a
 
+    def _rx_evt(self, **over):
+        payload = {"user_id": "alice", "post_id": "post_1", "emoji_name": "+1", "channel_id": "chan_9"}
+        payload.update(over)
+        return {"event": "reaction_added", "data": {"reaction": json.dumps(payload)}}
+
     @pytest.mark.asyncio
-    async def test_reaction_dispatches_internal_note_for_own_post(self):
+    async def test_reaction_stages_passive_sidecar_note(self):
         a = self._rx_adapter(read=True)
         a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
-        evt = {"event": "reaction_added", "data": {
-            "reaction": json.dumps({"user_id": "alice", "post_id": "post_1", "emoji_name": "+1", "channel_id": "chan_9"}),
-        }}
-        await a._handle_ws_event(evt)
-        assert a.handle_message.await_count == 1
-        msg = a.handle_message.await_args.args[0]
-        assert msg.internal is True
-        assert msg.message_type == MessageType.TEXT
-        assert "[Reaction]" in msg.text and "+1" in msg.text and "твой пост" in msg.text
+        await a._handle_ws_event(self._rx_evt())
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_called_once()
+        sk, notes = a.gateway_runner._set_pending_turn_sidecar_notes.call_args.args
+        assert len(notes) == 1 and "[Reaction]" in notes[0] and "+1" in notes[0]
+        assert isinstance(sk, str) and sk
+
+    @pytest.mark.asyncio
+    async def test_reaction_no_handle_message_turn(self):
+        """A reaction must NOT spawn a full agent turn (no visible reply)."""
+        a = self._rx_adapter(read=True)
+        a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
+        a.handle_message = AsyncMock()
+        await a._handle_ws_event(self._rx_evt())
+        a.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reaction_ignored_when_off(self):
         a = self._rx_adapter(read=False)
-        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "a", "post_id": "p"})}}
-        await a._handle_ws_event(evt)
+        await a._handle_ws_event(self._rx_evt())
         a._api_get.assert_not_awaited()
-        a.handle_message.assert_not_awaited()
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reaction_own_loop_dropped(self):
+    async def test_own_loop_dropped(self):
         a = self._rx_adapter(read=True)
-        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "bot_id", "post_id": "p"})}}
-        await a._handle_ws_event(evt)
+        await a._handle_ws_event(self._rx_evt(user_id="bot_id"))
         a._api_get.assert_not_awaited()
-        a.handle_message.assert_not_awaited()
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reaction_on_non_owned_post_ignored(self):
         a = self._rx_adapter(read=True)
-        # reaction on someone else's post, not in a bot thread
-        a._api_get.side_effect = [
-            {"id": "post_1", "user_id": "other", "channel_id": "chan_9"},  # the reacted post
-        ]
-        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "post_1", "emoji_name": "+1"})}}
-        await a._handle_ws_event(evt)
-        a.handle_message.assert_not_awaited()
+        a._api_get.return_value = {"id": "post_1", "user_id": "other", "channel_id": "chan_9"}
+        await a._handle_ws_event(self._rx_evt())
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reaction_in_bot_thread_accepted(self):
         a = self._rx_adapter(read=True)
         a._api_get.side_effect = [
-            {"id": "reply_1", "user_id": "alice", "root_id": "root_0", "channel_id": "chan_9"},  # reacted reply
-            {"id": "root_0", "user_id": "bot_id", "channel_id": "chan_9"},  # root owned by bot
+            {"id": "reply_1", "user_id": "alice", "root_id": "root_0", "channel_id": "chan_9"},
+            {"id": "root_0", "user_id": "bot_id", "channel_id": "chan_9"},
         ]
-        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "reply_1", "emoji_name": "❤️"})}}
-        await a._handle_ws_event(evt)
-        assert a.handle_message.await_count == 1
-        msg = a.handle_message.await_args.args[0]
-        assert msg.source.thread_id == "root_0"
-        assert "❤️" in msg.text and "твоём треде" in msg.text
+        await a._handle_ws_event(self._rx_evt(post_id="reply_1", emoji_name="❤️"))
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_called_once()
+        notes = a.gateway_runner._set_pending_turn_sidecar_notes.call_args.args[1]
+        assert "❤️" in notes[0] and "твоём треде" in notes[0]
 
     @pytest.mark.asyncio
-    async def test_reaction_routes_to_bot_thread_session_key(self):
+    async def test_staged_note_is_routed_to_thread_session(self):
         a = self._rx_adapter(read=True)
-        a._bot_user_id = "bot_id"
         a._api_get.side_effect = [
             {"id": "reply_1", "user_id": "alice", "root_id": "root_0", "channel_id": "chan_9"},
             {"id": "root_0", "user_id": "bot_id", "channel_id": "chan_9"},
         ]
-        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "reply_1", "emoji_name": "👍"})}}
-        await a._handle_ws_event(evt)
-        msg = a.handle_message.await_args.args[0]
-        # session key derived from source.thread_id must resolve under the thread root
-        sk = a._event_session_key(msg)
-        assert sk and "root_0" in sk
+        await a._handle_ws_event(self._rx_evt(post_id="reply_1"))
+        sk = a.gateway_runner._set_pending_turn_sidecar_notes.call_args.args[0]
+        assert "root_0" in sk
 
 
 # ---------------------------------------------------------------------------
