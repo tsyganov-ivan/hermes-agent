@@ -205,6 +205,9 @@ class MattermostAdapter(BasePlatformAdapter):
         # note (no visible reply); true responds actively with a full agent turn in the thread.
         _reply_rx = (config.extra.get("reaction_reply", "") or _get_scoped_secret("MATTERMOST_REACTION_REPLY", "false"))
         self._reaction_reply: bool = str(_reply_rx).strip().lower() in {"1", "true", "yes", "on"}
+        # Per-channel last inbound post, so react without an explicit message_id targets the
+        # conversation's own most recent message instead of (incorrectly) the home channel.
+        self._last_inbound_by_chat: Dict[str, str] = {}
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
@@ -280,10 +283,16 @@ class MattermostAdapter(BasePlatformAdapter):
         return result
 
     async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
-        """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the
-        post id to react on; ``chat_id`` is the channel. When ``message_id`` is empty, resolve the
-        most recent post in the channel (the tool's documented default: react to the last message)."""
+        """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the post
+        id to react on; ``chat_id`` the channel. Resolution order when ``message_id`` is empty:
+        the remembered last inbound post for this channel/thread (tracked from the WS stream), then
+        an API fetch of the channel's most recent post. Never falls back to the home channel."""
         post_id = (message_id or "").strip()
+        if not post_id and chat_id:
+            for key in (chat_id,):
+                post_id = self._last_inbound_by_chat.get(key, "")
+                if post_id:
+                    break
         if not post_id and chat_id:
             recent = await self._api_get(f"channels/{chat_id}/posts?per_page=1")
             order = (recent or {}).get("order") or []
@@ -814,6 +823,13 @@ class MattermostAdapter(BasePlatformAdapter):
             return
         channel_id, is_dm = post.get("channel_id", ""), data.get("channel_type", "O") == "D"
         message_text = post.get("message", "")
+        # Remember the last *processed* inbound post per channel: react without an explicit
+        # message_id targets this conversation's own most recent message (not the home channel).
+        if channel_id and post_id:
+            self._last_inbound_by_chat[channel_id] = post_id
+            thread_of = post.get("root_id") or None
+            if thread_of:  # remember by thread root too so react in a thread finalizes there
+                self._last_inbound_by_chat[f"{channel_id}:{thread_of}"] = post_id
         if not is_dm:  # DMs need no gating; channels are mention-gated.
             message_text = self._apply_channel_gating(channel_id, message_text)
             if message_text is None:
