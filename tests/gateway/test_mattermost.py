@@ -845,6 +845,16 @@ class TestMattermostSendReaction:
         assert res == {"user_id": "bot_id"}
 
     @pytest.mark.asyncio
+    async def test_add_reaction_resolves_latest_post_when_no_message_id(self):
+        a = _make_adapter()
+        a._bot_user_id = "bot_id"
+        a._api_get = AsyncMock(return_value={"order": ["latest_1", "older_2"]})
+        a._api_post = AsyncMock(return_value={"ok": True})
+        await a.add_reaction(chat_id="chan_9", message_id="", emoji="👍")
+        a._api_get.assert_awaited_once_with("channels/chan_9/posts?per_page=1")
+        assert a._api_post.await_args.args[1]["post_id"] == "latest_1"
+
+    @pytest.mark.asyncio
     async def test_remove_reaction_calls_delete(self):
         a = _make_adapter()
         a._bot_user_id = "bot_id"

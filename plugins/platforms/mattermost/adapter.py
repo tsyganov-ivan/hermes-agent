@@ -194,8 +194,16 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
         """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the
-        post id to react on; ``chat_id`` is accepted for interface parity (posts are global)."""
-        return await self.send_reaction(message_id, emoji)
+        post id to react on; ``chat_id`` is the channel. When ``message_id`` is empty, resolve the
+        most recent post in the channel (the tool's documented default: react to the last message)."""
+        post_id = (message_id or "").strip()
+        if not post_id and chat_id:
+            recent = await self._api_get(f"channels/{chat_id}/posts?per_page=1")
+            order = (recent or {}).get("order") or []
+            # order is descending: the first element is the newest post id.
+            if order:
+                post_id = str(order[0])
+        return await self.send_reaction(post_id, emoji)
 
     async def remove_reaction(self, chat_id: str, message_id: str) -> Dict[str, Any]:
         """Retract the bot's reaction from ``message_id`` (DELETE /api/v4/users/{me}/posts/{id}/reactions)."""
