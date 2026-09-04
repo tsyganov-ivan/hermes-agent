@@ -652,10 +652,16 @@ class MattermostAdapter(BasePlatformAdapter):
             # Active mode: surface the reaction as a full internal turn — the agent may reply.
             await self.handle_message(staged)
             return
-        session_key = self._event_session_key(staged)
         # Passive mode (default): stage the note as a turn sidecar so it rides the NEXT real
         # user message (via api_content), reaching the model without spawning its own reply.
+        # Key must be computed EXACTLY like the consuming turn does (runner._session_key_for_source),
+        # not the adapter-level _event_session_key, or the staged note lands under a different key.
         runner = getattr(self, "gateway_runner", None)
+        _key_fn = getattr(runner, "_session_key_for_source", None)
+        if callable(_key_fn):
+            session_key = _key_fn(source)
+        else:
+            session_key = self._event_session_key(staged)
         _set_notes = getattr(runner, "_set_pending_turn_sidecar_notes", None)
         if callable(_set_notes):
             _set_notes(session_key, [note])

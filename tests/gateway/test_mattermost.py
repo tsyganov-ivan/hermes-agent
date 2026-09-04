@@ -729,6 +729,7 @@ class TestMattermostReadReactions:
         # fake gateway runner with the sidecar-staging hook
         a.gateway_runner = MagicMock()
         a.gateway_runner._set_pending_turn_sidecar_notes = MagicMock()
+        a.gateway_runner._session_key_for_source = MagicMock(return_value="agent:main:mattermost:thread:chan_9:root_0")
         return a
 
     def _rx_evt(self, **over):
