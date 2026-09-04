@@ -60,6 +60,85 @@ def _channel_id_set(raw: Any) -> set:
 def _csv(value: Any) -> str:
     return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
+# Common unicode emoji glyphs → Mattermost emoji names. Mattermost's /reactions only accepts a
+# name (thumbsup/+1), NOT a raw glyph (a "👍" 404s with "couldn't find the emoji"). Strips
+# variation selectors (U+FE0F) and skin-tone modifiers before looking up, so "👍🏽" / "❤️" match.
+_REACTION_EMOJI_GLYPH_TO_NAME = {
+    "\U0001F44D": "+1",          # 👍 
+    "\U0001F44E": "-1",          # 👎
+    "\u2764": "heart",           # ❤
+    "\U0001F494": "broken_heart",# 💔
+    "\u2795": "heavy_plus_sign", # ➕
+    "\u2796": "heavy_minus_sign",# ➖
+    "\u2705": "white_check_mark",# ✅
+    "\u2611": "ballot_box_with_check",  # ☑
+    "\U0001F600": "grinning",    # 😀
+    "\U0001F603": "smiley",      # 😃
+    "\U0001F604": "smile",       # 😄
+    "\U0001F60A": "blush",       # 😊
+    "\U0001F60D": "heart_eyes",  # 😍
+    "\U0001F602": "joy",         # 😂
+    "\U0001F525": "fire",        # 🔥
+    "\U0001F389": "tada",        # 🎉
+    "\U0001F38A": "confetti_ball",# 🎊
+    "\U0001F680": "rocket",      # 🚀
+    "\U0001F44F": "clap",        # 👏
+    "\U0001F450": "open_hands",  # 👐
+    "\U0001F4AF": "100",         # 💯
+    "\u2B50": "star",            # ⭐
+    "\U0001F31F": "star2",       # 🌟
+    "\U0001F31E": "sun_with_face",  # 🌞
+    "\U0001F44C": "ok_hand",     # 👌
+    "\U0001F64F": "pray",        # 🙏
+    "\U0001F64C": "raised_hands",# 🙌
+    "\U0001F918": "metal",       # 🤘
+    "\U0001F596": "spock-hand",  # 🖖
+    "\U0001F4A1": "bulb",        # 💡
+    "\U0001F4A4": "zzz",         # 💤
+    "\U0001F612": "unamused",    # 😒
+    "\U0001F611": "expressionless",  # 😑
+    "\U0001F614": "pensive",     # 😔
+    "\U0001F62E": "open_mouth",  # 😮
+    "\U0001F62D": "sob",         # 😭
+    "\U0001F62A": "sleepy",      # 😪
+    "\U0001F622": "cry",         # 😢
+    "\U0001F61D": "stuck_out_tongue_closed_eyes",  # 😝
+    "\U0001F61B": "stuck_out_tongue",  # 😛
+    "\U0001F60B": "yum",         # 😋
+    "\U0001F60E": "sunglasses",  # 😎
+    "\U0001F913": "nerd_face",   # 🤓
+    "\U0001F914": "thinking",    # 🤔
+    "\U0001F4DCA": "chart_with_upwards_trend",  # 📊
+    "\u2708": "airplane",        # ✈
+    "\U0001F4C5": "calendar",    # 📅
+    "\U0001F4E7": "e-mail",      # 📧
+}
+
+
+def _normalize_reaction_emoji(value: str) -> str:
+    """Return the Mattermost emoji *name* for ''value''.
+
+    Passthrough unchanged when the caller already provided a name-like token (no unicode above
+    ASCII, no dashless colon wrapper). Otherwise looks up the stripped glyph in the map; falls back
+    to the caller's token (trimmed of ``:...:``) when unknown so the request at least reaches the
+    server instead of being silently dropped."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    stripped = raw.replace("\uFE0F", "")  # variation selector
+    # Skin-tone modifiers (U+1F3FB..U+1F3FF)
+    for cp in range(0x1F3FB, 0x1F400):
+        stripped = stripped.replace(chr(cp), "")
+    colon_wrapped = stripped.startswith(":") and stripped.endswith(":")
+    if stripped and not colon_wrapped:
+        # Any name token is already usable; glyphs are 1-2 code points and non-ASCII.
+        if all(ord(ch) < 128 for ch in stripped):
+            return stripped
+        resolved = _REACTION_EMOJI_GLYPH_TO_NAME.get(stripped) or _REACTION_EMOJI_GLYPH_TO_NAME.get(raw)
+        return resolved or stripped
+    inner = stripped[1:-1] if colon_wrapped else stripped
+    return inner or raw
+
 
 def _post_result(data: Dict[str, Any], error: str) -> SendResult:
     if not data or "id" not in data:
@@ -179,18 +258,26 @@ class MattermostAdapter(BasePlatformAdapter):
     async def send_reaction(self, post_id: str, emoji_name: str) -> Dict[str, Any]:
         """Set an emoji reaction on ``post_id`` via POST /api/v4/reactions.
 
-        Mattermost requires ``user_id`` (the actor) alongside ``post_id`` + ``emoji_name``; using the
-        bot's own user id lets the bot ack/signal with an emoji. No-op (returns {}) if the bot
-        identity is unknown yet."""
-        if not self._bot_user_id or not post_id or not (emoji_name or "").strip():
-            logger.warning("Mattermost: send_reaction skipped (bot_user_id=%s post=%s emoji=%s)",
-                           self._bot_user_id, post_id, emoji_name)
-            return {}
-        return await self._api_post("reactions", {
+        Mattermost requires ``user_id`` (the actor) alongside ``post_id`` + ``emoji_name`` and only
+        accepts the emoji's *name* (``thumbsup``/``+1``), NOT the unicode glyph (a raw ``👍`` 404s
+        with "couldn't find the emoji"). ``_normalize_reaction_emoji`` maps common glyphs to their
+        Mattermost names. Returns ``{"success": True/False, ...}`` (never a bare ``{}``) so callers
+        can't mistake an API failure for success."""
+        emoji = _normalize_reaction_emoji(emoji_name)
+        if not self._bot_user_id or not post_id or not emoji:
+            return {"success": False,
+                    "error": f"send_reaction skipped (bot_user_id={self._bot_user_id} post={post_id} emoji={emoji_name!r})"}
+        result = await self._api_post("reactions", {
             "user_id": self._bot_user_id,
             "post_id": post_id,
-            "emoji_name": emoji_name.strip(),
+            "emoji_name": emoji,
         })
+        if not result or "user_id" not in result:
+            return {"success": False,
+                    "error": "Mattermost rejected the reaction (unknown emoji name or server error). "
+                             f"emoji={emoji_name!r} → normalized={emoji!r}"}
+        result["success"] = True
+        return result
 
     async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
         """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the
@@ -205,11 +292,29 @@ class MattermostAdapter(BasePlatformAdapter):
                 post_id = str(order[0])
         return await self.send_reaction(post_id, emoji)
 
-    async def remove_reaction(self, chat_id: str, message_id: str) -> Dict[str, Any]:
-        """Retract the bot's reaction from ``message_id`` (DELETE /api/v4/users/{me}/posts/{id}/reactions)."""
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str = "") -> Dict[str, Any]:
+        """Retract the bot's reaction from ``message_id`` (DELETE /api/v4/users/{me}/posts/{id}/reactions/{emoji}).
+
+        A successful Mattermost reaction DELETE returns an empty 200 body; the shared ``_api``
+        helper maps that to ``{}``. So success == an empty dict here. ``emoji`` is optional because
+        a bare collection delete is accepted by some servers, but passing the exact name is the
+        reliable form."""
         if not self._bot_user_id or not message_id:
-            return {}
-        return await self._api("DELETE", f"users/{self._bot_user_id}/posts/{message_id}/reactions")
+            return {"success": False, "error": "remove_reaction skipped (no bot id or message id)"}
+        emoji_name = _normalize_reaction_emoji(emoji)
+        path = f"users/{self._bot_user_id}/posts/{message_id}/reactions"
+        if emoji_name:
+            path += f"/{emoji_name}"
+        result = await self._api("DELETE", path)
+        # DELETE success returns {} (empty body); the _api helper also returns {} on a >=400 error,
+        # but _last_post_status/_last_post_error are only tracked for POST. Reply success:false on
+        # any non-4xx-tolerant signal so the agent doesn't claim victory after a 404.
+        if result is not None and result:
+            result["success"] = True
+            return result
+        if self._last_post_status is not None and self._last_post_status >= 400:
+            return {"success": False, "error": self._last_post_error or f"HTTP {self._last_post_status}"}
+        return {"success": True}
 
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""

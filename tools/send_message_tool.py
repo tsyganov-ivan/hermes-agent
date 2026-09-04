@@ -100,7 +100,7 @@ def _handle_react(args, remove=False):
             return await _dispatch_on_gateway_loop(
                 _live_adapter(platform)[0],  # runner
                 lambda: react_fn(chat_id=chat_id, message_id=message_id,
-                                 **({} if remove else {"emoji": emoji})),
+                                 emoji=emoji),  # emoji carried for both react & unreact
                 "send_message: failed to schedule reaction on gateway loop")
 
         result = _run_async(_react_coro())

@@ -835,31 +835,55 @@ class TestMattermostSendReaction:
     async def test_add_reaction_posts_to_reactions_endpoint(self):
         a = _make_adapter()
         a._bot_user_id = "bot_id"
-        a._api_post = AsyncMock(return_value={"user_id": "bot_id"})
+        a._api_post = AsyncMock(return_value={"user_id": "bot_id", "post_id": "post_1", "emoji_name": "+1"})
         res = await a.add_reaction(chat_id="chan_9", message_id="post_1", emoji="👍")
         a._api_post.assert_awaited_once()
         path = a._api_post.await_args.args[0]
         payload = a._api_post.await_args.args[1]
         assert path == "reactions"
-        assert payload == {"user_id": "bot_id", "post_id": "post_1", "emoji_name": "👍"}
-        assert res == {"user_id": "bot_id"}
+        # "👍" (glyph) must be normalized to the Mattermost name "+1".
+        assert payload == {"user_id": "bot_id", "post_id": "post_1", "emoji_name": "+1"}
+        assert res["success"] is True
+
+    def test_normalize_reaction_emoji_glyph_to_name(self):
+        from plugins.platforms.mattermost.adapter import _normalize_reaction_emoji as norm
+        assert norm("👍") == "+1"
+        assert norm("❤️") == "heart"
+        assert norm("✅") == "white_check_mark"
+        assert norm("➕") == "heavy_plus_sign"
+        assert norm("thumbsup") == "thumbsup"          # already a name: passthrough
+        assert norm("+1") == "+1"
+        assert norm(":heart:") == "heart"               # colon wrapper stripped
+        assert norm("") == ""
 
     @pytest.mark.asyncio
     async def test_add_reaction_resolves_latest_post_when_no_message_id(self):
         a = _make_adapter()
         a._bot_user_id = "bot_id"
         a._api_get = AsyncMock(return_value={"order": ["latest_1", "older_2"]})
-        a._api_post = AsyncMock(return_value={"ok": True})
+        a._api_post = AsyncMock(return_value={"user_id": "bot_id", "emoji_name": "+1"})
         await a.add_reaction(chat_id="chan_9", message_id="", emoji="👍")
         a._api_get.assert_awaited_once_with("channels/chan_9/posts?per_page=1")
         assert a._api_post.await_args.args[1]["post_id"] == "latest_1"
+        assert a._api_post.await_args.args[1]["emoji_name"] == "+1"
 
     @pytest.mark.asyncio
-    async def test_remove_reaction_calls_delete(self):
+    async def test_add_reaction_reports_failure_verbatim(self):
+        """An API rejection must be surfaced as success:false, never a silent ''{}''."""
         a = _make_adapter()
         a._bot_user_id = "bot_id"
-        a._api = AsyncMock(return_value={"ok": True})
-        await a.remove_reaction(chat_id="chan_9", message_id="post_1")
+        a._api_post = AsyncMock(return_value={})  # _api returns {} on >=400
+        res = await a.add_reaction(chat_id="chan_9", message_id="post_1", emoji="no_such_emoji")
+        assert res["success"] is False
+        assert "error" in res
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_calls_delete_with_emoji(self):
+        a = _make_adapter()
+        a._bot_user_id = "bot_id"
+        a._api = AsyncMock(return_value={})
+        res = await a.remove_reaction(chat_id="chan_9", message_id="post_1", emoji="👍")
         method, path = a._api.await_args.args[0], a._api.await_args.args[1]
         assert method == "DELETE"
-        assert path == "users/bot_id/posts/post_1/reactions"
+        assert path == "users/bot_id/posts/post_1/reactions/+1"
+        assert res["success"] is True
