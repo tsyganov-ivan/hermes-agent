@@ -118,6 +118,10 @@ class MattermostAdapter(BasePlatformAdapter):
         # Reply mode: "thread" to nest replies, "off" for flat messages.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "") or _get_scoped_secret("MATTERMOST_REPLY_MODE", "off")).lower()
+        # Read reactions: when true, reaction_added on the bot's own posts/threads is
+        # surfaced to the agent as an internal signal (no visible reply). Default off.
+        _read_rx = (config.extra.get("read_reactions", "") or _get_scoped_secret("MATTERMOST_READ_REACTIONS", "false"))
+        self._read_reactions: bool = str(_read_rx).strip().lower() in {"1", "true", "yes", "on"}
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
@@ -167,6 +171,33 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _api_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self._api("POST", path, payload)
+
+    async def send_reaction(self, post_id: str, emoji_name: str) -> Dict[str, Any]:
+        """Set an emoji reaction on ``post_id`` via POST /api/v4/reactions.
+
+        Mattermost requires ``user_id`` (the actor) alongside ``post_id`` + ``emoji_name``; using the
+        bot's own user id lets the bot ack/signal with an emoji. No-op (returns {}) if the bot
+        identity is unknown yet."""
+        if not self._bot_user_id or not post_id or not (emoji_name or "").strip():
+            logger.warning("Mattermost: send_reaction skipped (bot_user_id=%s post=%s emoji=%s)",
+                           self._bot_user_id, post_id, emoji_name)
+            return {}
+        return await self._api_post("reactions", {
+            "user_id": self._bot_user_id,
+            "post_id": post_id,
+            "emoji_name": emoji_name.strip(),
+        })
+
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
+        """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the
+        post id to react on; ``chat_id`` is accepted for interface parity (posts are global)."""
+        return await self.send_reaction(message_id, emoji)
+
+    async def remove_reaction(self, chat_id: str, message_id: str) -> Dict[str, Any]:
+        """Retract the bot's reaction from ``message_id`` (DELETE /api/v4/users/{me}/posts/{id}/reactions)."""
+        if not self._bot_user_id or not message_id:
+            return {}
+        return await self._api("DELETE", f"users/{self._bot_user_id}/posts/{message_id}/reactions")
 
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
@@ -547,8 +578,80 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.warning("Mattermost: error downloading file %s: %s", fid, exc)
         return media_urls, media_types
 
+    async def _reaction_on_own_content(self, post_id: str) -> Optional[Tuple[str, Optional[str]]]:
+        """Return (channel_id, thread_root_id) when the reacted post is the bot's own post or lives
+        in a thread the bot started; else None. Resolves the author via the API (never trusts the
+        WS event, which only carries the reacted post id). thread_root_id is the post's root_id (or
+        None for a top-level own post). Own-post author == bot; an own thread means root author == bot."""
+        post = await self._api_get(f"posts/{post_id}")
+        if not post or not post.get("id"):
+            return None
+        post_user = (post.get("user_id") or "").strip()
+        root_id = (post.get("root_id") or "").strip() or None
+        if post_user == self._bot_user_id:
+            return (post.get("channel_id", ""), root_id)
+        if root_id and root_id != post_id:
+            root = await self._api_get(f"posts/{root_id}")
+            if root and (root.get("user_id") or "").strip() == self._bot_user_id:
+                return (post.get("channel_id", ""), root_id)
+        return None
+
+    async def _handle_reaction_event(self, data: Dict[str, Any]) -> None:
+        """Surface a `reaction_added` on the bot's own content to the agent as an internal signal.
+
+        Injected via MessageEvent(internal=True) so it lands in the thread's session as context the
+        model can adapt to — no separate visible reply is produced. Dropped unless the reacted post
+        is the bot's own or sits in a thread the bot owns (Ivan's filter), and never for the bot's
+        own reactions."""
+        import json as _json
+        # reaction_added data can carry the reaction object either inline or JSON-encoded.
+        raw_reaction = data.get("reaction")
+        if isinstance(raw_reaction, str):
+            try:
+                reaction = _json.loads(raw_reaction)
+            except (ValueError, TypeError):
+                reaction = {}
+        elif isinstance(raw_reaction, dict):
+            reaction = raw_reaction
+        else:
+            reaction = {}
+        emitter = str(reaction.get("user_id") or data.get("user_id") or "").strip()
+        post_id = str(reaction.get("post_id") or data.get("post_id") or "").strip()
+        emoji = str(reaction.get("emoji_name") or data.get("emoji_name") or "").strip()
+        channel_id = str(reaction.get("channel_id") or data.get("channel_id") or "").strip()
+        if self._bot_user_id and emitter == self._bot_user_id:
+            return  # never react to the bot's own reactions (feedback loops)
+        if not post_id or not emoji:
+            return
+        own = await self._reaction_on_own_content(post_id)
+        if not own:
+            logger.debug("Mattermost: ignoring reaction %s on non-owned post %s", emoji, post_id)
+            return
+        channel_id = channel_id or own[0]
+        thread_root = own[1]
+        # Same thread resolution as the `posted` path so the note lands in the right session.
+        thread_id = thread_root
+        if not thread_id and self._reply_mode == "thread" and channel_id:
+            thread_id = post_id
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type=_CHANNEL_TYPE_MAP.get((data.get("channel_type") or "").upper(), "channel"),
+            user_id=emitter, user_name=(data.get("user_name") or "").lstrip("@") or emitter,
+            thread_id=thread_id, message_id=post_id)
+        note = f"[Reaction] {source.user_name or emitter} reacted {emoji}" \
+               + (" → твой пост" if not thread_root else " → в твоём треде") + "."
+        logger.info("Mattermost: reaction signal %s %s → %s", emitter, emoji, post_id)
+        from gateway.platforms.base import MessageEvent, MessageType
+        await self.handle_message(MessageEvent(
+            text=note, message_type=MessageType.TEXT, source=source, internal=True, message_id=post_id))
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
-        if event.get("event") != "posted":
+        evt_kind = event.get("event")
+        if evt_kind == "reaction_added":
+            if self._read_reactions:
+                await self._handle_reaction_event(event.get("data", {}))
+            return
+        if evt_kind != "posted":
             return
         data = event.get("data", {})
         try:
@@ -702,7 +805,8 @@ def interactive_setup() -> None:
 _YAML_BRIDGE = (  # (yaml key, env var, yaml value → env string); allowed_channels is a whitelist
     ("require_mention", "MATTERMOST_REQUIRE_MENTION", lambda v: str(v).lower()),
     ("free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", _csv),
-    ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", _csv))
+    ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", _csv),
+    ("read_reactions", "MATTERMOST_READ_REACTIONS", lambda v: str(v).lower()))
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:

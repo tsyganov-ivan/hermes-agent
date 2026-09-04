@@ -709,3 +709,120 @@ class TestMultiplexProfileScope:
             # os.environ.
             assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
 
+
+# ---------------------------------------------------------------------------
+# Reaction reading (read_reactions): WS reaction_added → internal signal
+# ---------------------------------------------------------------------------
+
+class TestMattermostReadReactions:
+    def _rx_adapter(self, read=True):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"url": "https://mm.example.com", "read_reactions": str(read).lower()},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a.handle_message = AsyncMock()
+        a._api_get = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_reaction_dispatches_internal_note_for_own_post(self):
+        a = self._rx_adapter(read=True)
+        a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
+        evt = {"event": "reaction_added", "data": {
+            "reaction": json.dumps({"user_id": "alice", "post_id": "post_1", "emoji_name": "+1", "channel_id": "chan_9"}),
+        }}
+        await a._handle_ws_event(evt)
+        assert a.handle_message.await_count == 1
+        msg = a.handle_message.await_args.args[0]
+        assert msg.internal is True
+        assert msg.message_type == MessageType.TEXT
+        assert "[Reaction]" in msg.text and "+1" in msg.text and "твой пост" in msg.text
+
+    @pytest.mark.asyncio
+    async def test_reaction_ignored_when_off(self):
+        a = self._rx_adapter(read=False)
+        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "a", "post_id": "p"})}}
+        await a._handle_ws_event(evt)
+        a._api_get.assert_not_awaited()
+        a.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reaction_own_loop_dropped(self):
+        a = self._rx_adapter(read=True)
+        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "bot_id", "post_id": "p"})}}
+        await a._handle_ws_event(evt)
+        a._api_get.assert_not_awaited()
+        a.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reaction_on_non_owned_post_ignored(self):
+        a = self._rx_adapter(read=True)
+        # reaction on someone else's post, not in a bot thread
+        a._api_get.side_effect = [
+            {"id": "post_1", "user_id": "other", "channel_id": "chan_9"},  # the reacted post
+        ]
+        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "post_1", "emoji_name": "+1"})}}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reaction_in_bot_thread_accepted(self):
+        a = self._rx_adapter(read=True)
+        a._api_get.side_effect = [
+            {"id": "reply_1", "user_id": "alice", "root_id": "root_0", "channel_id": "chan_9"},  # reacted reply
+            {"id": "root_0", "user_id": "bot_id", "channel_id": "chan_9"},  # root owned by bot
+        ]
+        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "reply_1", "emoji_name": "❤️"})}}
+        await a._handle_ws_event(evt)
+        assert a.handle_message.await_count == 1
+        msg = a.handle_message.await_args.args[0]
+        assert msg.source.thread_id == "root_0"
+        assert "❤️" in msg.text and "твоём треде" in msg.text
+
+    @pytest.mark.asyncio
+    async def test_reaction_routes_to_bot_thread_session_key(self):
+        a = self._rx_adapter(read=True)
+        a._bot_user_id = "bot_id"
+        a._api_get.side_effect = [
+            {"id": "reply_1", "user_id": "alice", "root_id": "root_0", "channel_id": "chan_9"},
+            {"id": "root_0", "user_id": "bot_id", "channel_id": "chan_9"},
+        ]
+        evt = {"event": "reaction_added", "data": {"reaction": json.dumps({"user_id": "alice", "post_id": "reply_1", "emoji_name": "👍"})}}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        # session key derived from source.thread_id must resolve under the thread root
+        sk = a._event_session_key(msg)
+        assert sk and "root_0" in sk
+
+
+# ---------------------------------------------------------------------------
+# Sending reactions (add_reaction / remove_reaction)
+# ---------------------------------------------------------------------------
+
+class TestMattermostSendReaction:
+    @pytest.mark.asyncio
+    async def test_add_reaction_posts_to_reactions_endpoint(self):
+        a = _make_adapter()
+        a._bot_user_id = "bot_id"
+        a._api_post = AsyncMock(return_value={"user_id": "bot_id"})
+        res = await a.add_reaction(chat_id="chan_9", message_id="post_1", emoji="👍")
+        a._api_post.assert_awaited_once()
+        path = a._api_post.await_args.args[0]
+        payload = a._api_post.await_args.args[1]
+        assert path == "reactions"
+        assert payload == {"user_id": "bot_id", "post_id": "post_1", "emoji_name": "👍"}
+        assert res == {"user_id": "bot_id"}
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_calls_delete(self):
+        a = _make_adapter()
+        a._bot_user_id = "bot_id"
+        a._api = AsyncMock(return_value={"ok": True})
+        await a.remove_reaction(chat_id="chan_9", message_id="post_1")
+        method, path = a._api.await_args.args[0], a._api.await_args.args[1]
+        assert method == "DELETE"
+        assert path == "users/bot_id/posts/post_1/reactions"
