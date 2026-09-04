@@ -122,6 +122,10 @@ class MattermostAdapter(BasePlatformAdapter):
         # surfaced to the agent as an internal signal (no visible reply). Default off.
         _read_rx = (config.extra.get("read_reactions", "") or _get_scoped_secret("MATTERMOST_READ_REACTIONS", "false"))
         self._read_reactions: bool = str(_read_rx).strip().lower() in {"1", "true", "yes", "on"}
+        # Reply-to-reaction: when read_reactions is on, false (default) stages a passive sidecar
+        # note (no visible reply); true responds actively with a full agent turn in the thread.
+        _reply_rx = (config.extra.get("reaction_reply", "") or _get_scoped_secret("MATTERMOST_REACTION_REPLY", "false"))
+        self._reaction_reply: bool = str(_reply_rx).strip().lower() in {"1", "true", "yes", "on"}
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
@@ -644,9 +648,13 @@ class MattermostAdapter(BasePlatformAdapter):
         from gateway.platforms.base import MessageEvent, MessageType
         staged = MessageEvent(
             text=note, message_type=MessageType.TEXT, source=source, internal=True, message_id=post_id)
+        if self._reaction_reply:
+            # Active mode: surface the reaction as a full internal turn — the agent may reply.
+            await self.handle_message(staged)
+            return
         session_key = self._event_session_key(staged)
-        # Passive injection: stage the note as a turn sidecar so it rides the NEXT real user
-        # message (via api_content), reaching the model without spawning its own turn/reply.
+        # Passive mode (default): stage the note as a turn sidecar so it rides the NEXT real
+        # user message (via api_content), reaching the model without spawning its own reply.
         runner = getattr(self, "gateway_runner", None)
         _set_notes = getattr(runner, "_set_pending_turn_sidecar_notes", None)
         if callable(_set_notes):
@@ -815,7 +823,8 @@ _YAML_BRIDGE = (  # (yaml key, env var, yaml value → env string); allowed_chan
     ("require_mention", "MATTERMOST_REQUIRE_MENTION", lambda v: str(v).lower()),
     ("free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", _csv),
     ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", _csv),
-    ("read_reactions", "MATTERMOST_READ_REACTIONS", lambda v: str(v).lower()))
+    ("read_reactions", "MATTERMOST_READ_REACTIONS", lambda v: str(v).lower()),
+    ("reaction_reply", "MATTERMOST_REACTION_REPLY", lambda v: str(v).lower()))
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:

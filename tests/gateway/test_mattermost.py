@@ -737,6 +737,19 @@ class TestMattermostReadReactions:
         return {"event": "reaction_added", "data": {"reaction": json.dumps(payload)}}
 
     @pytest.mark.asyncio
+    async def test_reaction_reply_mode_forks_full_turn(self):
+        """reaction_reply=true surfaces the reaction as an active internal turn (may reply)."""
+        a = self._rx_adapter(read=True)
+        a._reaction_reply = True
+        a.handle_message = AsyncMock()
+        a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
+        await a._handle_ws_event(self._rx_evt())
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.internal is True and "[Reaction]" in msg.text
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_reaction_stages_passive_sidecar_note(self):
         a = self._rx_adapter(read=True)
         a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
