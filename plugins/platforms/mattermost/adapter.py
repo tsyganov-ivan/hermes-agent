@@ -600,6 +600,19 @@ class MattermostAdapter(BasePlatformAdapter):
                 return (post.get("channel_id", ""), root_id)
         return None
 
+    async def _channel_type_code(self, channel_id: str) -> str:
+        """Resolve the real Mattermost channel type (D/G/O) via the API.
+
+        ``reaction_added`` WS events do NOT carry ``channel_type`` (unlike ``posted``), so a
+        reaction on a DM would otherwise be staged under a ``channel`` session key that never
+        matches the running DM conversation. ``GET /channels/{id}`` returns ``type`` = D/G/O."""
+        if channel_id:
+            ch = await self._api_get(f"channels/{channel_id}")
+            code = (ch or {}).get("type", "")
+            if code in {"D", "G", "O", "P"}:
+                return code
+        return "O"
+
     async def _handle_reaction_event(self, data: Dict[str, Any]) -> None:
         """Surface a `reaction_added` on the bot's own content to the agent as an internal signal.
 
@@ -633,13 +646,14 @@ class MattermostAdapter(BasePlatformAdapter):
             return
         channel_id = channel_id or own[0]
         thread_root = own[1]
+        channel_code = await self._channel_type_code(channel_id)
         # Same thread resolution as the `posted` path so the note lands in the right session.
         thread_id = thread_root
         if not thread_id and self._reply_mode == "thread" and channel_id:
             thread_id = post_id
         source = self.build_source(
             chat_id=channel_id,
-            chat_type=_CHANNEL_TYPE_MAP.get((data.get("channel_type") or "").upper(), "channel"),
+            chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
             user_id=emitter, user_name=(data.get("user_name") or "").lstrip("@") or emitter,
             thread_id=thread_id, message_id=post_id)
         note = f"[Reaction] {source.user_name or emitter} reacted {emoji}" \

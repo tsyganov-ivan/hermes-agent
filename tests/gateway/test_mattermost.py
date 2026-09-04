@@ -726,6 +726,7 @@ class TestMattermostReadReactions:
         a = MattermostAdapter(config)
         a._bot_user_id = "bot_id"
         a._api_get = AsyncMock()
+        a._channel_type_code = AsyncMock(return_value="O")
         # fake gateway runner with the sidecar-staging hook
         a.gateway_runner = MagicMock()
         a.gateway_runner._set_pending_turn_sidecar_notes = MagicMock()
@@ -749,6 +750,17 @@ class TestMattermostReadReactions:
         msg = a.handle_message.await_args.args[0]
         assert msg.internal is True and "[Reaction]" in msg.text
         a.gateway_runner._set_pending_turn_sidecar_notes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reaction_resolves_dm_channel_type_for_session(self):
+        """reaction has no channel_type in WS; the adapter must resolve D via the API so the
+        note is staged under the DM session key, not a channel key."""
+        a = self._rx_adapter(read=True)
+        a._channel_type_code = AsyncMock(return_value="D")
+        a._api_get.return_value = {"id": "post_1", "user_id": "bot_id", "channel_id": "chan_9"}
+        await a._handle_ws_event(self._rx_evt())
+        a._channel_type_code.assert_awaited_once_with("chan_9")
+        a.gateway_runner._set_pending_turn_sidecar_notes.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_reaction_stages_passive_sidecar_note(self):
