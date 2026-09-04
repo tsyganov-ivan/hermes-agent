@@ -92,7 +92,18 @@ def _handle_react(args, remove=False):
         return tool_error(f"Platform '{platform_name}' does not support message reactions.")
     try:
         from model_tools import _run_async
-        result = _run_async(react_fn(chat_id=chat_id, message_id=message_id, **({} if remove else {"emoji": emoji})))
+
+        async def _react_coro():
+            # Dispatch onto the gateway loop like every other adapter send: aiohttp sessions are
+            # bound to the gateway loop, so running add_reaction/remove_reaction on a tool-worker
+            # loop raises "Timeout context manager should be used inside a task".
+            return await _dispatch_on_gateway_loop(
+                _live_adapter(platform)[0],  # runner
+                lambda: react_fn(chat_id=chat_id, message_id=message_id,
+                                 **({} if remove else {"emoji": emoji})),
+                "send_message: failed to schedule reaction on gateway loop")
+
+        result = _run_async(_react_coro())
     except Exception as e:
         return json.dumps(_error(f"Reaction failed: {e}"))
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
