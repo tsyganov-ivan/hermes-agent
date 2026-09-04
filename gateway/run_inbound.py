@@ -1494,6 +1494,20 @@ class GatewayInboundMixin:
                     f"{message_text}"
                 )
 
+        # Mattermost: surface the triggering post id so the model can react/like/reply to the
+        # SPECIFIC message (react_message requires message_id). Rides the per-turn user message,
+        # never the cached system prompt (changes every turn → would bust agent-cache signature).
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.MATTERMOST
+            and getattr(event, "message_id", None)
+        ):
+            message_text = (
+                f"[Triggering post id: `{event.message_id}` — use as `message_id` "
+                f"for react_message (or reply/delete) targeting this exact post.]\n\n"
+                f"{message_text}"
+            )
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer even when the quoted text is already in history:
             # it's disambiguation (*which* prior message), not deduplication.

@@ -283,22 +283,13 @@ class MattermostAdapter(BasePlatformAdapter):
         return result
 
     async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
-        """Adapter method consumed by send_message_tool action='react'. ``message_id`` is the post
-        id to react on; ``chat_id`` the channel. Resolution order when ``message_id`` is empty:
-        the remembered last inbound post for this channel/thread (tracked from the WS stream), then
-        an API fetch of the channel's most recent post. Never falls back to the home channel."""
+        """Adapter method consumed by send_message_tool action='react'. Reacts ONLY on the exact
+        ``message_id`` given — there is deliberately no resolution fallback (reacting to a guessed
+        "last message" silently misfires when the bot's own progress bubbles sit in the thread)."""
         post_id = (message_id or "").strip()
-        if not post_id and chat_id:
-            for key in (chat_id,):
-                post_id = self._last_inbound_by_chat.get(key, "")
-                if post_id:
-                    break
-        if not post_id and chat_id:
-            recent = await self._api_get(f"channels/{chat_id}/posts?per_page=1")
-            order = (recent or {}).get("order") or []
-            # order is descending: the first element is the newest post id.
-            if order:
-                post_id = str(order[0])
+        if not post_id:
+            return {"success": False,
+                    "error": "add_reaction requires message_id — react to a specific post, not a guess."}
         return await self.send_reaction(post_id, emoji)
 
     async def remove_reaction(self, chat_id: str, message_id: str, emoji: str = "") -> Dict[str, Any]:

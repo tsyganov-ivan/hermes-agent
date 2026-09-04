@@ -30,11 +30,11 @@ registry.register(
     schema={
         "name": "react_message",
         "description": (
-            "Attach (action='react') or retract (action='unreact') an emoji reaction on a message "
-            "on a connected messaging platform (e.g. Mattermost). Lets the bot ack/like/signal on "
-            "any message the platform exposes — typically the most recent message in the current "
-            "chat or a specific message_id. Requires the live gateway adapter (not available in "
-            "cron/standalone contexts)."
+            "Attach (action='react') or retract (action='unreact') an emoji reaction on a "
+            "SPECIFIC message on a connected messaging platform (e.g. Mattermost). The bot MUST "
+            "provide message_id (the exact post id from the conversation context) and target "
+            "(platform:chat_id) — there is no fallback that guesses which message to react to. "
+            "Requires the live gateway adapter (not available in cron/standalone contexts)."
         ),
         "parameters": {
             "type": "object",
@@ -46,16 +46,13 @@ registry.register(
                 },
                 "target": {
                     "type": "string",
-                    "description": "Platform target: 'platform', 'platform:chat_id', or "
-                                    "'platform:chat_id:thread_id'. e.g. 'mattermost', "
-                                    "'mattermost:5ap78uro47rbpqce3fh4'. Omit to default to the current "
-                                    "chat/thread this turn is running in.",
+                    "description": "Platform target must include a chat id: 'platform:chat_id'. "
+                                    "e.g. 'mattermost:5ap78uro47rbpqce3fh4'.",
                 },
                 "message_id": {
                     "type": "string",
-                    "description": "id of the message to react to. Omit to target the most recent "
-                                    "message in the resolved chat (the current conversation when "
-                                    "target is omitted).",
+                    "description": "REQUIRED. The exact id of the message to react to (from the "
+                                    "conversation context / post id).",
                 },
                 "emoji": {
                     "type": "string",
@@ -63,7 +60,7 @@ registry.register(
                                     "action='react'.",
                 },
             },
-            "required": [],
+            "required": ["target", "message_id"],
         },
     },
     handler=lambda args, **kw: react_message(args, **kw),

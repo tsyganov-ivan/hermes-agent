@@ -62,31 +62,22 @@ def _handle_list():
 
 def _handle_react(args, remove=False):
     """Attach (``remove=True``: retract) an emoji reaction via the live gateway adapter; no
-    standalone fallback because reacting needs the adapter's live message-id state. The reaction
-    targets ``message_id`` if given, else the adapter's remembered last inbound post for that chat
-    (NOT the home channel — reacting to a message is chat-specific). A missing chat falls back to
-    the current conversation (HERMES_SESSION_* env), so 'react here' targets the right thread;
-    if neither message_id nor any chat is available we error rather than guess."""
-    target, emoji = args.get("target", ""), (args.get("emoji") or "").strip()
-    message_id = (args.get("message_id") or "").strip() or None
-    if not target or (not remove and not emoji):
-        return tool_error("'target' is required when action='unreact'" if remove
-                          else "Both 'target' and 'emoji' are required when action='react'")
+    standalone fallback because reacting needs the adapter's live message-id state.
 
-    # Fall back to the current conversation (the thread the agent is handling) when the caller
-    # gave a bare platform or nothing usable. This keeps 'react to this' on the *current* chat/DM
-    # instead of the home channel. Thread id is intentionally NOT appended: Mattermost DM/channel
-    # resolution keys on the chat's latest post, and a chat:thread suffix is not a stable mattermost
-    # target on every parse path.
+    The bot MUST name the exact post via ``message_id`` — there is deliberately NO fallback to a
+    "last message" heuristic, which misfires when the bot's own progress bubbles sit in the thread
+    (reacting to the wrong post silently). target (platform:chat) + message_id are both required.
+    """
+    target = (args.get("target") or "").strip()
+    emoji = (args.get("emoji") or "").strip()
+    message_id = (args.get("message_id") or "").strip() or None
+    if not target:
+        return tool_error("'target' is required (e.g. 'mattermost:chat_id').")
     if not message_id:
-        try:
-            from gateway.session_context import get_session_env
-            sess_platform = get_session_env("HERMES_SESSION_PLATFORM").strip()
-            sess_chat = get_session_env("HERMES_SESSION_CHAT_ID").strip()
-            if sess_platform and sess_chat and (not target.strip() or target.strip().lower() == sess_platform.lower()):
-                target = f"{sess_platform}:{sess_chat}"
-        except Exception:
-            pass
+        return tool_error("'message_id' is required — react to a SPECIFIC message, not a guess. "
+                          "Pass the exact post id from the conversation context.")
+    if not remove and not emoji:
+        return tool_error("'emoji' is required for action='react'.")
 
     # Platform-native ids (e.g. photon GUIDs) match no parser/directory entry; the adapter validates.
     platform_name, chat_id, _thread_id, resolution_error = _resolve_tool_target(target, pass_unresolved_references=True)
@@ -95,8 +86,6 @@ def _handle_react(args, remove=False):
     platform, err = _platform_enum(platform_name)
     if err:
         return tool_error(err)
-    if not chat_id:
-        chat_id = ""  # adapter resolves last inbound per chat, or reacts by message_id directly
     _, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error(f"Reactions require a live {platform_name} adapter in the running "

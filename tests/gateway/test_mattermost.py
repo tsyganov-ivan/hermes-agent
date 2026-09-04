@@ -857,15 +857,15 @@ class TestMattermostSendReaction:
         assert norm("") == ""
 
     @pytest.mark.asyncio
-    async def test_add_reaction_resolves_latest_post_when_no_message_id(self):
+    async def test_add_reaction_requires_message_id_no_fallback(self):
+        """No fallback: add_reaction without message_id must fail explicitly (never guess/last-post)."""
         a = _make_adapter()
         a._bot_user_id = "bot_id"
-        a._api_get = AsyncMock(return_value={"order": ["latest_1", "older_2"]})
-        a._api_post = AsyncMock(return_value={"user_id": "bot_id", "emoji_name": "+1"})
-        await a.add_reaction(chat_id="chan_9", message_id="", emoji="👍")
-        a._api_get.assert_awaited_once_with("channels/chan_9/posts?per_page=1")
-        assert a._api_post.await_args.args[1]["post_id"] == "latest_1"
-        assert a._api_post.await_args.args[1]["emoji_name"] == "+1"
+        a._api_get = AsyncMock()
+        a._api_post = AsyncMock()
+        res = await a.add_reaction(chat_id="chan_9", message_id="", emoji="👍")
+        assert res["success"] is False
+        a._api_post.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_add_reaction_reports_failure_verbatim(self):
@@ -887,3 +887,32 @@ class TestMattermostSendReaction:
         assert method == "DELETE"
         assert path == "users/bot_id/posts/post_1/reactions/+1"
         assert res["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Triggering post id is surfaced to the model (react_message needs it)
+# ---------------------------------------------------------------------------
+
+class TestMattermostTriggeringPostId:
+
+    def test_prepend_inbound_context_exposes_post_id(self):
+        from gateway.run_inbound import GatewayInboundMixin
+        from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+        from gateway.config import Platform
+        source = SessionSource(
+            platform=Platform.MATTERMOST, chat_id="chan_9", chat_type="dm", message_id="post_abc",
+        )
+        # build a real MessageEvent
+        event = MessageEvent(text="поставь реакцию", message_type=MessageType.TEXT,
+                             source=source, message_id="post_abc")
+        out = GatewayInboundMixin._prepend_inbound_reply_context(event, source, "поставь реакцию")
+        assert "post_abc" in out
+        assert "react_message" in out
+
+    def test_prepend_inbound_other_platform_unchanged_for_missing_id(self):
+        from gateway.run_inbound import GatewayInboundMixin
+        from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+        from gateway.config import Platform
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+        event = MessageEvent(text="hi", message_type=MessageType.TEXT, source=source, message_id=None)
+        assert GatewayInboundMixin._prepend_inbound_reply_context(event, source, "hi") == "hi"
