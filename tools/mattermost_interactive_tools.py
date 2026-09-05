@@ -12,6 +12,7 @@ same as ``react_message``.
 from __future__ import annotations
 
 import json
+from typing import Optional
 
 from tools.registry import registry, tool_error
 from tools.send_message_tool import (
@@ -20,9 +21,9 @@ from tools.send_message_tool import (
 from tools.send_message_senders import _live_adapter
 
 
-def _target_chat_id(target: str) -> tuple:
-    platform_name, chat_id, _thread_id, error = _resolve_tool_target(
-        target, pass_unresolved_references=True)
+def _target(chat_id: str, thread_id: Optional[str] = None, reply_to: Optional[str] = None) -> tuple:
+    platform_name, cid, tid, error = _resolve_tool_target(
+        chat_id, pass_unresolved_references=True)
     if error:
         return None, None, error
     platform, err = _platform_enum(platform_name)
@@ -30,11 +31,11 @@ def _target_chat_id(target: str) -> tuple:
         return None, None, err
     if platform_name != "mattermost":
         return None, None, "Interactive messages are only supported on mattermost, got " + platform_name
-    return platform, chat_id, None
+    return platform, cid, tid
 
 
 def send_interactive_message(args: dict, **kw) -> str:
-    """Send a post with interactive buttons and/or a select menu to a Mattermost channel."""
+    """Send a post with interactive buttons and/or a select menu to a Mattermost conversation."""
     target = (args.get("target") or "").strip()
     text = (args.get("text") or "").strip()
     buttons = args.get("buttons") or []
@@ -43,9 +44,16 @@ def send_interactive_message(args: dict, **kw) -> str:
         return tool_error("'target' is required (e.g. 'mattermost:chat_id').")
     if not text:
         return tool_error("'text' is required.")
-    platform, chat_id, error = _target_chat_id(target)
-    if error:
-        return tool_error(error)
+    platform, chat_id, thread_id = _target(target)
+    if chat_id is None:
+        return tool_error(thread_id)
+    # If the bot is replying inside a thread, inherit the current thread when the
+    # target names only the channel — otherwise buttons land in the channel root.
+    if not thread_id:
+        from gateway.session_context import get_session_env
+        th = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+        if th:
+            thread_id = th
     _, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error("Interactive messages require a live mattermost adapter "
@@ -59,7 +67,8 @@ def send_interactive_message(args: dict, **kw) -> str:
         async def _coro():
             return await _dispatch_on_gateway_loop(
                 _live_adapter(platform)[0],
-                lambda: send_fn(chat_id=chat_id, text=text, buttons=buttons, menu=menu),
+                lambda: send_fn(chat_id=chat_id, text=text, buttons=buttons, menu=menu,
+                                reply_to=thread_id),
                 "mattermost_interact: failed to schedule send_interactive on gateway loop")
 
         result = _run_async(_coro())
@@ -80,9 +89,9 @@ def update_message(args: dict, **kw) -> str:
         return tool_error("'target' is required (e.g. 'mattermost:chat_id').")
     if not message_id:
         return tool_error("'message_id' is required — update a SPECIFIC message (post id).")
-    platform, chat_id, error = _target_chat_id(target)
-    if error:
-        return tool_error(error)
+    platform, chat_id, _thread_id = _target(target)
+    if chat_id is None:
+        return tool_error(_thread_id)
     _, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error("Updating a message requires a live mattermost adapter.")
@@ -118,9 +127,9 @@ def ephemeral_reply(args: dict, **kw) -> str:
         return tool_error("'user_id' is required — the Mattermost user who should see this.")
     if not text:
         return tool_error("'text' is required.")
-    platform, chat_id, error = _target_chat_id(target)
-    if error:
-        return tool_error(error)
+    platform, chat_id, _thread_id = _target(target)
+    if chat_id is None:
+        return tool_error(_thread_id)
     _, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error("Ephemeral replies require a live mattermost adapter.")
@@ -154,7 +163,8 @@ registry.register(
             "Send a post with interactive buttons and/or a select menu to a Mattermost "
             "conversation. The bot provides message text, buttons=[{id, label, style}] and/or "
             "menu={id, name, placeholder, options:[{label, value}]}. target is "
-            "'mattermost:chat_id'. Clicks/menu selections come back to the agent as user "
+            "'mattermost:chat_id' (optionally ':...thread_id' to post into a thread). "
+            "Clicks/menu selections come back to the agent as user "
             "messages. Use update_message to replace the post text afterwards, and "
             "ephemeral_reply to answer just one user."
         ),
