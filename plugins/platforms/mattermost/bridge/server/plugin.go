@@ -193,6 +193,11 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		actionID = req.Type
 	}
 	selected, _ := req.Context["selected_option"].(string)
+	if selected == "" {
+		if lbl, _ := req.Context["label"].(string); lbl != "" {
+			selected = lbl
+		}
+	}
 
 	payload := map[string]any{
 		"action_id":       actionID,
@@ -210,8 +215,62 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("hermes-bridge interact action=%s user=%s channel=%s", actionID, req.UserId, req.ChannelId)
 	p.API.PublishWebSocketEvent(wsExitInteract, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
+
+	// After the user picks, replace the buttons with a compact confirmation so no
+	// second choice is possible. This is pure transport: the plugin does not know
+	// what the agent will do with the selection, it just disables the interactive UI.
+	if req.PostId != "" {
+		if updated := p.interactUpdatePost(req.PostId, selected); updated != nil {
+			jsonOk(w, map[string]any{"ok": true, "update": updated})
+			return
+		}
+	}
 	// MM requires a 200 JSON response or it shows "Action failed to execute".
 	jsonOk(w, map[string]any{"ok": true})
+}
+
+// interactUpdatePost returns a modified copy of the post with the interactive
+// attachments' actions cleared, so a picked button/menu cannot be re-chosen.
+// The message is left intact; the selection is recorded in the post props so the
+// agent can see it without parsing transport details.
+func (p *Bridge) interactUpdatePost(postID, selected string) map[string]any {
+	post, err := p.client.Post.GetPost(postID)
+	if err != nil || post == nil {
+		return nil
+	}
+	srcProps := post.GetProps()
+	props := make(map[string]any, len(srcProps))
+	for k, v := range srcProps {
+		props[k] = v
+	}
+	attachments, _ := props["attachments"].([]any)
+	if len(attachments) == 0 {
+		return nil
+	}
+	stripped := make([]any, 0, len(attachments))
+	for _, a := range attachments {
+		am, ok := a.(map[string]any)
+		if !ok {
+			stripped = append(stripped, a)
+			continue
+		}
+		copy := map[string]any{}
+		for k, v := range am {
+			copy[k] = v
+		}
+		delete(copy, "actions")
+		stripped = append(stripped, copy)
+	}
+	props["attachments"] = stripped
+	if selected != "" {
+		props["selected"] = selected
+	}
+	return map[string]any{
+		"props":     props,
+		"message":   post.Message,
+		"hashtags":  post.Hashtags,
+		"signature": "mattermost-bridge",
+	}
 }
 
 func main() {
