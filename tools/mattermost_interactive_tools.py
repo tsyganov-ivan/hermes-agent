@@ -88,8 +88,10 @@ def send_interactive_message(args: dict, **kw) -> str:
     if isinstance(result, dict):
         result.pop("raw_response", None)  # don't leak raw transport internals to the model
         result["question_id"] = question_id
+        result["acknowledgment_required"] = False  # buttons already visible; don't reply about them
         return json.dumps(result)
-    return json.dumps({"success": bool(result), "question_id": question_id})
+    return json.dumps({"success": bool(result), "question_id": question_id,
+                       "acknowledgment_required": False})
 
 
 def update_message(args: dict, **kw) -> str:
