@@ -986,14 +986,16 @@ class TestMattermostBridgeEvents:
     async def test_bridge_interact_builds_command_event(self):
         a = self._bridge_adapter()
         evt = {"event": "hermes_bridge_interact", "data": {
-            "action_id": "approve", "post_id": "post_1", "channel_id": "chan_9",
-            "user_id": "bob", "context": {"action_id": "approve"},
+            "action_id": "approve", "label": "Approve", "post_id": "post_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "approve", "label": "Approve"},
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
         msg = a.handle_message.await_args.args[0]
-        assert msg.message_type == MessageType.COMMAND
-        assert msg.text == "/approve"
+        assert msg.message_type == MessageType.TEXT
+        # Button click surfaces the label as text — never an invented slash command.
+        assert msg.text == "Approve"
         assert msg.source.user_id == "bob"
 
     @pytest.mark.asyncio
@@ -1003,7 +1005,7 @@ class TestMattermostBridgeEvents:
         evt = {"event": "hermes_bridge_interact", "data": {
             "action_id": "pick", "selected_option": "chocolate",
             "post_id": "post_1", "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "pick", "selected_option": "chocolate"},
+            "context": {"action_id": "pick", "selected_option": "chocolate", "question_id": "q_1234"},
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
@@ -1012,6 +1014,7 @@ class TestMattermostBridgeEvents:
         assert msg.text == "chocolate"
         assert msg.raw_message.get("action_id") == "pick"
         assert msg.raw_message.get("selected_option") == "chocolate"
+        assert msg.raw_message.get("response_for_question_id") == "q_1234"
 
     @pytest.mark.asyncio
     async def test_bridge_command_namespaced_prefix_still_hits(self):
@@ -1200,6 +1203,8 @@ class TestMattermostInteractiveSend:
         assert btn["type"] == "button" and btn["id"] == "yes"
         assert btn["integration"]["url"] == "/plugins/hermes-bridge/interact"
         assert btn["integration"]["context"]["action_id"] == "yes"
+        assert btn["integration"]["context"]["label"] == "Yes"
+        assert "question_id" not in btn["integration"]["context"]
         menu_action = actions[1]
         assert menu_action["type"] == "select"
         assert menu_action["options"] == [{"text": "A", "value": "a"}]

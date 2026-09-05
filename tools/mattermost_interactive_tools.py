@@ -12,6 +12,7 @@ same as ``react_message``.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Optional
 
 from tools.registry import registry, tool_error
@@ -69,6 +70,8 @@ def send_interactive_message(args: dict, **kw) -> str:
     send_fn = getattr(adapter, "send_interactive", None)
     if not callable(send_fn):
         return tool_error("Mattermost adapter does not support send_interactive.")
+    # Unique id tying this interactive question to the user's later click/selection.
+    question_id = uuid.uuid4().hex[:12]
     try:
         from model_tools import _run_async
 
@@ -76,7 +79,7 @@ def send_interactive_message(args: dict, **kw) -> str:
             return await _dispatch_on_gateway_loop(
                 _live_adapter(platform)[0],
                 lambda: send_fn(chat_id=chat_id, text=text, buttons=buttons, menu=menu,
-                                reply_to=reply_to),
+                                reply_to=reply_to, question_id=question_id),
                 "mattermost_interact: failed to schedule send_interactive on gateway loop")
 
         result = _run_async(_coro())
@@ -84,8 +87,9 @@ def send_interactive_message(args: dict, **kw) -> str:
         return json.dumps({"success": False, "error": f"send_interactive failed: {e}"})
     if isinstance(result, dict):
         result.pop("raw_response", None)  # don't leak raw transport internals to the model
+        result["question_id"] = question_id
         return json.dumps(result)
-    return json.dumps({"success": bool(result)})
+    return json.dumps({"success": bool(result), "question_id": question_id})
 
 
 def update_message(args: dict, **kw) -> str:
@@ -172,9 +176,11 @@ registry.register(
             "conversation. The bot provides message text, buttons=[{id, label, style}] and/or "
             "menu={id, name, placeholder, options:[{label, value}]}. target is "
             "'mattermost:chat_id' (optionally ':...thread_id' to post into a thread). "
-            "Clicks/menu selections come back to the agent as user "
-            "messages. Use update_message to replace the post text afterwards, and "
-            "ephemeral_reply to answer just one user."
+            "Clicks/menu selections come back to the agent as user messages. Use update_message "
+            "to replace the post text afterwards, and ephemeral_reply to answer just one user. "
+            "The interactive message IS the answer — after a SUCCESSFUL send_interactive_message "
+            "do NOT write any extra explanatory text or 'done' message; the buttons you posted "
+            "are the deliverable."
         ),
         "parameters": {
             "type": "object",

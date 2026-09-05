@@ -366,9 +366,11 @@ class MattermostAdapter(BasePlatformAdapter):
         return await self._post_preserving_thread(chat_id, payload, metadata)
 
     async def send_interactive(
-        self, chat_id: str, text: str, buttons: Optional[List[Dict[str, Any]]] = None,
-        menu: Optional[Dict[str, Any]] = None, *, reply_to: Optional[str] = None,
-        metadata: _Metadata = None) -> SendResult:
+            self, chat_id: str, text: str, buttons: Optional[List[Dict[str, Any]]] = None,
+            menu: Optional[Dict[str, Any]] = None, *,
+            reply_to: Optional[str] = None,
+            question_id: Optional[str] = None,
+            metadata: _Metadata = None) -> SendResult:
         """Send a post with interactive message buttons and/or a select menu.
 
         All MM transport detail is hidden: the bot never sees integration URLs or
@@ -383,23 +385,28 @@ class MattermostAdapter(BasePlatformAdapter):
             bid = str(b.get("id") or "").strip()
             if not bid:
                 continue
+            blabel = str(b.get("label") or bid)
+            ctx = {"action_id": bid, "label": blabel}
+            if question_id:
+                ctx["question_id"] = question_id
             actions.append({
-                "id": bid, "type": "button", "name": str(b.get("label") or bid),
+                "id": bid, "type": "button", "name": blabel,
                 "style": str(b.get("style") or "default"),
-                "integration": {"url": "/plugins/hermes-bridge/interact",
-                                "context": {"action_id": bid}},
+                "integration": {"url": "/plugins/hermes-bridge/interact", "context": ctx},
             })
         if menu:
             mid = str(menu.get("id") or "").strip()
             if mid:
+                mctx = {"action_id": mid}
+                if question_id:
+                    mctx["question_id"] = question_id
                 actions.append({
                     "id": mid, "type": "select", "name": str(menu.get("placeholder") or menu.get("name") or mid),
                     "data_source": str(menu.get("data_source") or ""),
                     "options": [
                         {"text": str(o.get("label") or o.get("value")), "value": str(o.get("value") or "")}
                         for o in (menu.get("options") or [])],
-                    "integration": {"url": "/plugins/hermes-bridge/interact",
-                                    "context": {"action_id": mid}},
+                    "integration": {"url": "/plugins/hermes-bridge/interact", "context": mctx},
                 })
         if not actions:
             return SendResult(success=False, error="send_interactive: no valid actions")
@@ -940,10 +947,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         The plugin relays an interactive callback (button/menu) as a structured
         WS event (action_id, selected_option, context). Build a MessageEvent so
-        the agent sees the user's choice. Button clicks surface as a command
-        (`/action_id`); menu selections carry the picked value as the text and
-        the full context (session markers, etc.) in ``raw_message`` for the
-        handler to resolve without knowing MM transport details.
+        the agent sees the user's choice. Both button clicks and menu selections
+        surface as ordinary TEXT choices (the label/value the user picked), with
+        the action identity in ``raw_message`` — never as an agent slash command.
         """
         from gateway.platforms.base import MessageEvent, MessageType
         post_id = str(data.get("post_id") or "").strip()
@@ -962,19 +968,19 @@ class MattermostAdapter(BasePlatformAdapter):
             chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
             user_id=user_id, user_name=user_name,
             thread_id=None, message_id=post_id)
-        # Button click -> `/action_id`; menu select -> the picked value (verbose
-        # so the agent answers the choice the user actually made).
-        if selected:
-            text = selected
-            msg_type = MessageType.TEXT
-        else:
-            text = f"/{action_id}"
-            msg_type = MessageType.COMMAND
-        logger.info("Mattermost: bridge interact action=%s selected=%r from %s in %s",
-                    action_id, selected, user_name, channel_id)
+        # Both buttons and menus deliver the user's choice as plain TEXT so the
+        # agent sees the picked label/value, not an invented slash command.
+        label = str(context.get("label") or "").strip() if isinstance(context, dict) else ""
+        question_id = str(context.get("question_id") or "").strip() if isinstance(context, dict) else ""
+        text = selected or label or action_id
+        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r from %s in %s",
+                    action_id, selected, label, user_name, channel_id)
         await self.handle_message(MessageEvent(
-            text=text, message_type=msg_type, source=source, message_id=post_id,
-            raw_message={**context, "action_id": action_id, "selected_option": selected}))
+            text=text, message_type=MessageType.TEXT, source=source, message_id=post_id,
+            raw_message={**context,
+                         "action_id": action_id,
+                         "selected_option": selected,
+                         "response_for_question_id": question_id or None}))
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")
