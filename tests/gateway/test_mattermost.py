@@ -1424,3 +1424,91 @@ class TestMattermostModelPicker:
     async def test_bridge_interact_url_derives_from_plugin_path(self):
         a = self._adapter(bridge_plugin_path="plugins/hermes-bridge/config")
         assert a._bridge_interact_url() == "/plugins/hermes-bridge/interact"
+
+
+class TestMattermostChoicePicker:
+
+    def _adapter(self, **extra):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(
+            enabled=True, token="test-token",
+            extra={"url": "https://mm.example.com", **extra},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a._session = object()  # satisfies the "connected" guard
+        return a
+
+    def _choices(self):
+        return [
+            {"value": "none", "label": "Off", "is_current": False},
+            {"value": "high", "label": "High", "is_current": True},
+            {"value": "low", "label": "Low", "is_current": False},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_send_choice_picker_posts_select_menu(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "chp_1"})
+        async def on_sel(chat, value): return f"applied {value}"
+        result = await a.send_choice_picker("chan_9", "Reasoning", self._choices(),
+                                            "sess", on_sel, metadata={})
+        assert result.success is True
+        assert result.message_id == "chp_1"
+        payload = a._api_post.call_args.args[1]
+        assert payload["message"] == ""
+        attach = payload["props"]["attachments"][0]
+        menu = next(act for act in attach["actions"] if act["id"] == "hchsel")
+        assert menu["type"] == "select"
+        assert {o["value"] for o in menu["options"]} == {"none", "high", "low"}
+        labels = {o["text"] for o in menu["options"]}
+        assert any("✓" in lbl and "High" in lbl for lbl in labels)  # is_current marked
+        assert any(act["id"] == "hchcan" for act in attach["actions"])
+        assert "chan_9" in a._choice_picker_state
+        assert a._choice_picker_state["chan_9"]["on_choice_selected"] is on_sel
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_choice_selection_runs_apply(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "chp_1"})
+        a._api = AsyncMock(return_value={})
+        calls = []
+        async def on_sel(chat, value):
+            calls.append((chat, value))
+            return "reasoning = high"
+        await a.send_choice_picker("chan_9", "Reasoning", self._choices(), "sess", on_sel, metadata={})
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "hchsel", "selected_option": "high",
+            "post_id": "chp_1", "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "hchsel"}}}
+        a.handle_message = AsyncMock()
+        await a._handle_ws_event(evt)
+        # Picker click is not a user-visible TEXT turn.
+        a.handle_message.assert_not_called()
+        assert calls == [("chan_9", "high")]
+        assert "chan_9" not in a._choice_picker_state
+        put = a._api.call_args.args[2]
+        assert put["props"]["attachments"][0]["text"] == "reasoning = high"
+        assert put["props"]["attachments"][0]["actions"] == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_choice_cancel(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "chp_1"})
+        a._api = AsyncMock(return_value={})
+        await a.send_choice_picker("chan_9", "Fast", self._choices(), "sess", lambda *_: None, metadata={})
+        await a._handle_choice_picker_callback({
+            "action_id": "hchcan", "selected_option": "",
+            "post_id": "chp_1", "channel_id": "chan_9"})
+        assert "chan_9" not in a._choice_picker_state
+        assert a._api.call_args.args[2]["props"]["attachments"][0]["actions"] == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_choice_with_no_state_is_dropped(self):
+        a = self._adapter()
+        a.handle_message = AsyncMock()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "hchsel", "selected_option": "high", "post_id": "chp_1",
+            "channel_id": "chan_9", "user_id": "bob", "context": {}}}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_not_called()

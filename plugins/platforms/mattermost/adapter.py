@@ -228,6 +228,8 @@ class MattermostAdapter(BasePlatformAdapter):
         # on_model_selected closure + the provider list, so a click over the bridge
         # can drive provider -> model drill-down and then run the switch.
         self._model_picker_state: Dict[str, dict] = {}
+        # Choice pickers (/reasoning, /fast): flat menu state keyed by channel_id.
+        self._choice_picker_state: Dict[str, dict] = {}
 
     # --- HTTP helpers ---
 
@@ -609,8 +611,8 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_model_picker failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 
-    def _picker_actions(self, menus: List[Dict[str, Any]], *, cancel: bool = False) -> List[Dict[str, Any]]:
-        """Build MM actions for the picker: the given select menus + optional Cancel button."""
+    def _picker_actions(self, menus: List[Dict[str, Any]], *, cancel: bool = False, cancel_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Build MM actions for a picker: the given select menus + optional Cancel button."""
         actions = []
         interact_url = self._bridge_interact_url()
         for m in menus:
@@ -624,11 +626,12 @@ class MattermostAdapter(BasePlatformAdapter):
                 "integration": {"url": interact_url, "context": {"action_id": mid}},
             })
         if cancel:
+            cancel_id = str(cancel_id or self._PICKER_ACTION_CANCEL)
             actions.append({
-                "id": self._PICKER_ACTION_CANCEL, "type": "button", "name": "Отмена",
+                "id": cancel_id, "type": "button", "name": "Отмена",
                 "style": "default",
                 "integration": {"url": interact_url,
-                                "context": {"action_id": self._PICKER_ACTION_CANCEL}},
+                                "context": {"action_id": cancel_id}},
             })
         return actions
 
@@ -720,6 +723,85 @@ class MattermostAdapter(BasePlatformAdapter):
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
         return await self._send_url_as_file(chat_id, image_url, caption, reply_to, "image", metadata)
+
+    # --- choice pickers (/reasoning, /fast) — flat single-select menu + cancel ---
+
+    # Alnum-only action ids, disjoint from the /model picker's "hmp*" namespace.
+    _CHOICE_ACTION_SELECT = "hchsel"   # menu -> selected_option = the choice value
+    _CHOICE_ACTION_CANCEL = "hchcan"   # button -> abort
+
+    async def send_choice_picker(
+            self, chat_id: str, title: str, choices: list, session_key: str,
+            on_choice_selected, metadata: _Metadata = None) -> SendResult:
+        """Send a flat single-choice picker (one select menu -> one value).
+
+        Backs the gateway's finite-choice commands (`/reasoning`, `/fast`); each choice dict is
+        ``{value, label, is_current}``. The ``on_choice_selected(chat_id, value)`` closure owns the
+        apply logic; this adapter only renders the menu and relays the pick (like send_model_picker).
+        """
+        if self._session is None:
+            return SendResult(success=False, error="Not connected")
+        opts = []
+        for c in choices or []:
+            value = str(c.get("value") or "").strip()
+            if not value:
+                continue
+            label = str(c.get("label") or value)
+            if c.get("is_current"):
+                label = f"✓ {label}"
+            opts.append({"text": label, "value": value})
+        if not opts:
+            return SendResult(success=False, error="No choices")
+        try:
+            menu = {"id": self._CHOICE_ACTION_SELECT, "name": "Выбор", "placeholder": "Выбор",
+                    "options": opts}
+            actions = self._picker_actions([menu], cancel=True, cancel_id=self._CHOICE_ACTION_CANCEL)
+            text = self.format_message(title)
+            thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            root_id = await self._resolve_root_id(thread_id) if thread_id else None
+            payload = _with_mentions_disabled({"channel_id": chat_id, "message": "",
+                                               "props": {"attachments": [{"text": text, "actions": actions}]}})
+            if root_id:
+                payload["root_id"] = root_id
+            data = await self._api_post("posts", payload)
+            if not data or "id" not in data:
+                return SendResult(success=False, error="Failed to create choice picker post")
+            self._choice_picker_state[str(chat_id)] = {
+                "msg_id": data["id"], "choices": choices, "session_key": session_key,
+                "on_choice_selected": on_choice_selected,
+            }
+            return SendResult(success=True, message_id=data["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] send_choice_picker failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _handle_choice_picker_callback(self, data: Dict[str, Any]) -> None:
+        """Route a bridge interact callback into a flat choice picker (select/cancel)."""
+        channel_id = str(data.get("channel_id") or "").strip()
+        post_id = str(data.get("post_id") or "").strip()
+        action_id = str(data.get("action_id") or "").strip()
+        selected = str(data.get("selected_option") or "").strip()
+        state = self._choice_picker_state.get(channel_id)
+        if not state:
+            return
+        if action_id == self._CHOICE_ACTION_CANCEL:
+            self._choice_picker_state.pop(channel_id, None)
+            await self._update_picker_post(post_id, "⚙ Choice picker cancelled.", [])
+            return
+        if action_id == self._CHOICE_ACTION_SELECT and selected:
+            cb = state.get("on_choice_selected")
+            self._choice_picker_state.pop(channel_id, None)
+            if not cb:
+                await self._update_picker_post(post_id, "❌ Picker expired — run the command again.", [])
+                return
+            try:
+                result_text = await cb(channel_id, selected)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] choice picker selection failed: %s", self.name, exc)
+                result_text = f"❌ Application failed ({exc})."
+            await self._update_picker_post(post_id, self.format_message(result_text), [])
+            logger.info("[%s] choice picker: value %s chosen in %s", self.name, selected, channel_id)
+            return
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -1135,6 +1217,14 @@ class MattermostAdapter(BasePlatformAdapter):
         user_name = str(data.get("user_name") or "").lstrip("@") or user_id
         if not action_id or not channel_id:
             logger.warning("Mattermost: hermes_bridge_interact missing action/channel: %s", data)
+            return
+        # Choice pickers (/reasoning, /fast) route into their flat menu state machine first —
+        # "hch*" is disjoint from the /model picker's "hmp*" namespace.
+        if action_id.startswith("hch"):
+            await self._handle_choice_picker_callback({
+                "post_id": post_id, "action_id": action_id,
+                "selected_option": selected, "context": context,
+                "channel_id": channel_id, "user_id": user_id})
             return
         # /model picker menus/buttons route into the picker state machine (closed-loop with the
         # gateway's on_model_selected), NOT into a user-visible TEXT turn. Drop only the hmp*
