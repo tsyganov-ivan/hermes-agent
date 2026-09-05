@@ -1296,3 +1296,131 @@ def test_send_interactive_tool_inherits_dm_message_when_no_thread():
     assert res.get("success") is True
     assert captured["reply_to"] == "dm_last_post"
     assert captured["chat_id"] == "chan_9"
+
+
+# ---------------------------------------------------------------------------
+# /model interactive picker (send_model_picker + bridge interact routing)
+# ---------------------------------------------------------------------------
+
+class TestMattermostModelPicker:
+
+    def _adapter(self, **extra):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter, _with_mentions_disabled
+        config = PlatformConfig(
+            enabled=True, token="test-token",
+            extra={"url": "https://mm.example.com", **extra},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a._session = object()  # satisfies the "connected" guard without aiohttp
+        return a
+
+    def _providers(self):
+        return [
+            {"slug": "openai", "name": "OpenAI", "models": ["openai/gpt-5.5", "openai/gpt-5.5-pro"],
+             "total_models": 2},
+            {"slug": "anthropic", "name": "Anthropic", "models": ["anthropic/claude-opus-4"],
+             "total_models": 1},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_posts_provider_menu(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "pick_1"})
+        async def on_sel(chat, model, prov): return "switched"
+        result = await a.send_model_picker(
+            "chan_9", self._providers(), "openai/gpt-5.5", "openai",
+            "sess_1", on_sel, metadata={})
+        assert result.success is True
+        assert result.message_id == "pick_1"
+        # Provider selection is a select menu with a Cancel button, on one attachment.
+        payload = a._api_post.call_args.args[1]
+        assert payload["channel_id"] == "chan_9"
+        assert payload["message"] == ""
+        attach = payload["props"]["attachments"][0]
+        actions = attach["actions"]
+        provider = next(act for act in actions if act["id"] == "hmppro")
+        assert provider["type"] == "select"
+        assert provider["integration"]["url"] == "/plugins/hermes-bridge/interact"
+        assert {o["value"] for o in provider["options"]} == {"openai", "anthropic"}
+        assert any(act["id"] == "hmpcan" for act in actions)
+        # State stored keyed by chat_id with the callback closure.
+        assert "chan_9" in a._model_picker_state
+        assert a._model_picker_state["chan_9"]["on_model_selected"] is on_sel
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_provider_selection_redraws_to_model_menu(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "pick_1"})
+        a._api = AsyncMock(return_value={})
+        await a.send_model_picker("chan_9", self._providers(), "", "openai", "sess", lambda *_: None, metadata={})
+        a._api.reset_mock()
+        a.handle_message = AsyncMock()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "hmppro", "selected_option": "anthropic",
+            "post_id": "pick_1", "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "hmppro"}}}
+        await a._handle_ws_event(evt)
+        # Never surfaces as a user-visible TEXT turn.
+        a.handle_message.assert_not_called()
+        # Same post PUT-updated: now a model menu for the picked provider.
+        put = a._api.call_args
+        assert put.args[0] == "PUT" and put.args[1] == "posts/pick_1/patch"
+        model_menu = next(act for act in put.args[2]["props"]["attachments"][0]["actions"]
+                          if act["id"] == "hmpmod")
+        assert {o["value"] for o in model_menu["options"]} == {"anthropic/claude-opus-4"}
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_model_selection_runs_switch(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "pick_1"})
+        a._api = AsyncMock(return_value={})
+        calls = []
+        async def on_sel(chat, model, prov):
+            calls.append((chat, model, prov))
+            return "switched to gpt-5.5"
+        await a.send_model_picker("chan_9", self._providers(), "", "openai", "sess", on_sel, metadata={})
+        # Step 1: pick provider
+        await a._handle_model_picker_callback({
+            "action_id": "hmppro", "selected_option": "openai",
+            "post_id": "pick_1", "channel_id": "chan_9"})
+        a._api.reset_mock()
+        # Step 2: pick model
+        await a._handle_model_picker_callback({
+            "action_id": "hmpmod", "selected_option": "openai/gpt-5.5",
+            "post_id": "pick_1", "channel_id": "chan_9"})
+        assert calls == [("chan_9", "openai/gpt-5.5", "openai")]
+        # State closed + post finalized with the confirmation text and NO actions.
+        assert "chan_9" not in a._model_picker_state
+        put = a._api.call_args.args[2]
+        attach = put["props"]["attachments"][0]
+        assert attach["text"] == "switched to gpt-5.5"
+        assert "actions" not in attach or attach["actions"] == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_cancel_closes_picker(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "pick_1"})
+        a._api = AsyncMock(return_value={})
+        await a.send_model_picker("chan_9", self._providers(), "", "", "sess", lambda *_: None, metadata={})
+        await a._handle_model_picker_callback({
+            "action_id": "hmpcan", "selected_option": "",
+            "post_id": "pick_1", "channel_id": "chan_9"})
+        assert "chan_9" not in a._model_picker_state
+        put = a._api.call_args.args[2]
+        assert put["props"]["attachments"][0]["actions"] == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_picker_with_no_state_is_dropped(self):
+        a = self._adapter()
+        a.handle_message = AsyncMock()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "hmpcan", "post_id": "pick_1",
+            "channel_id": "chan_9", "user_id": "bob", "context": {}}}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_url_derives_from_plugin_path(self):
+        a = self._adapter(bridge_plugin_path="plugins/hermes-bridge/config")
+        assert a._bridge_interact_url() == "/plugins/hermes-bridge/interact"

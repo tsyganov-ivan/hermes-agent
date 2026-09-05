@@ -224,6 +224,10 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
+        # /model interactive picker state keyed by channel_id. Holds the gateway's
+        # on_model_selected closure + the provider list, so a click over the bridge
+        # can drive provider -> model drill-down and then run the switch.
+        self._model_picker_state: Dict[str, dict] = {}
 
     # --- HTTP helpers ---
 
@@ -542,6 +546,176 @@ class MattermostAdapter(BasePlatformAdapter):
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         payload = _with_mentions_disabled({"message": self.format_message(content)})
         return _post_result(await self._api("PUT", f"posts/{message_id}/patch", payload), "Failed to edit post")
+
+    # --- /model interactive picker (gateway-drive, mirrors Telegram's send_model_picker) ---
+
+    # Action_id namespace for the model picker, intercepted in _handle_bridge_interact BEFORE
+    # the generic interactive->TEXT path. Keep these ALNUMS ONLY: Mattermost's action ids may
+    # consist of letters and numbers, no other characters (documented for interactive actions).
+    _PICKER_ACTION_PROVIDER = "hmppro"     # select menu -> selected_option = provider slug
+    _PICKER_ACTION_MODEL = "hmpmod"        # select menu -> selected_option = model id
+    _PICKER_ACTION_CANCEL = "hmpcan"       # button -> abort the picker
+
+    async def send_model_picker(
+            self, chat_id: str, providers: list, current_model: str, current_provider: str,
+            session_key: str, on_model_selected, metadata: _Metadata = None) -> SendResult:
+        """Send an interactive two-step model picker (provider menu -> model menu).
+
+        The gateway's ``_handle_model_command`` calls this (keyword args) when the platform
+        supports it; the whole switch + persist logic lives in the ``on_model_selected``
+        closure it passes in — this adapter only renders the menus and relays the pick. The
+        same post is PUT-updated in place on each step (like Telegram editing its picker).
+        """
+        if self._session is None:
+            return SendResult(success=False, error="Not connected")
+        provider_options = []
+        for p in providers or []:
+            slug = str(p.get("slug") or "").strip()
+            if not slug:
+                continue
+            label = str(p.get("name") or slug)
+            if slug == current_provider:
+                label = f"✓ {label}"
+            provider_options.append({"text": label, "value": slug})
+        if not provider_options:
+            return SendResult(success=False, error="No providers")
+        try:
+            menu = {
+                "id": self._PICKER_ACTION_PROVIDER, "name": "Провайдер",
+                "placeholder": "Провайдер",
+                "options": provider_options,
+            }
+            actions = self._picker_actions([menu], cancel=True)
+            text = self.format_message(
+                f"⚙ **Model Configuration**\n\nCurrent model: `{current_model or 'unknown'}`\n"
+                f"Provider: {current_provider}\n\nSelect a provider:")
+            thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            root_id = await self._resolve_root_id(thread_id) if thread_id else None
+            payload = _with_mentions_disabled({"channel_id": chat_id, "message": "",
+                                               "props": {"attachments": [{"text": text, "actions": actions}]}})
+            if root_id:
+                payload["root_id"] = root_id
+            data = await self._api_post("posts", payload)
+            if not data or "id" not in data:
+                return SendResult(success=False, error="Failed to create model picker post")
+            self._model_picker_state[str(chat_id)] = {
+                "msg_id": data["id"], "providers": providers or [], "session_key": session_key,
+                "on_model_selected": on_model_selected, "current_model": current_model,
+                "current_provider": current_provider, "selected_provider": None,
+                "selected_provider_name": None,
+            }
+            return SendResult(success=True, message_id=data["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] send_model_picker failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    def _picker_actions(self, menus: List[Dict[str, Any]], *, cancel: bool = False) -> List[Dict[str, Any]]:
+        """Build MM actions for the picker: the given select menus + optional Cancel button."""
+        actions = []
+        interact_url = self._bridge_interact_url()
+        for m in menus:
+            mid = str(m.get("id") or "").strip()
+            if not mid or not m.get("options"):
+                continue
+            actions.append({
+                "id": mid, "type": "select", "name": str(m.get("placeholder") or m.get("name") or mid),
+                "data_source": "",
+                "options": [{"text": str(o["text"]), "value": str(o["value"])} for o in m["options"]],
+                "integration": {"url": interact_url, "context": {"action_id": mid}},
+            })
+        if cancel:
+            actions.append({
+                "id": self._PICKER_ACTION_CANCEL, "type": "button", "name": "Отмена",
+                "style": "default",
+                "integration": {"url": interact_url,
+                                "context": {"action_id": self._PICKER_ACTION_CANCEL}},
+            })
+        return actions
+
+    def _bridge_interact_url(self) -> str:
+        """Relative interact URL for the native bridge plugin (e.g. /plugins/hermes-bridge/interact).
+
+        Derives from the configured ``bridge_plugin_path`` (which points at the config endpoint,
+        ``plugins/hermes-bridge/config``) so it tracks the plugin id instead of a hardcoded string.
+        """
+        parts = str(self._bridge_plugin_path or "").strip("/").split("/")
+        if parts and parts[-1] == "config":
+            parts = parts[:-1]
+        return f"/{'/'.join(parts)}/interact" if parts else "/plugins/hermes-bridge/interact"
+
+    async def _update_picker_post(self, post_id: str, text: str, actions: Optional[List[Dict[str, Any]]]) -> None:
+        """PUT-patch the picker post to a new step (attachments text + optional actions)."""
+        attrs: Dict[str, Any] = {"text": text}
+        if actions is not None:
+            attrs["actions"] = actions
+        payload = _with_mentions_disabled({"message": "",
+                                           "props": {"attachments": [attrs]}})
+        try:
+            await self._api("PUT", f"posts/{post_id}/patch", payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] picker post update failed: %s", self.name, exc)
+
+    async def _handle_model_picker_callback(self, data: Dict[str, Any]) -> None:
+        """Route a bridge interact callback into the /model picker state machine."""
+        channel_id = str(data.get("channel_id") or "").strip()
+        post_id = str(data.get("post_id") or "").strip()
+        action_id = str(data.get("action_id") or "").strip()
+        selected = str(data.get("selected_option") or "").strip()
+        state = self._model_picker_state.get(channel_id)
+        if not state:
+            return  # picker already closed/expired — drop the stray click
+        try:
+            from hermes_cli.providers import get_label
+        except ImportError:
+            get_label = lambda slug: slug  # noqa: E731
+        if action_id == self._PICKER_ACTION_CANCEL:
+            self._model_picker_state.pop(channel_id, None)
+            await self._update_picker_post(post_id, "⚙ Model picker cancelled.", [])
+            return
+        if action_id == self._PICKER_ACTION_PROVIDER and selected:
+            provider = next((p for p in state["providers"] if str(p.get("slug")) == selected), None)
+            if not provider:
+                await self._update_picker_post(post_id, "❌ Provider not found.", [])
+                self._model_picker_state.pop(channel_id, None)
+                return
+            models = provider.get("models") or []
+            total = provider.get("total_models") or len(models)
+            shown = models[:50]
+            opts = []
+            for m in shown:
+                label = str(m).rsplit("/", 1)[-1] if "/" in str(m) else str(m)
+                if m == state.get("current_model"):
+                    label = f"✓ {label}"
+                opts.append({"text": label, "value": str(m)})
+            if not opts:
+                await self._update_picker_post(post_id, "❌ Provider has no pickable models.", [])
+                self._model_picker_state.pop(channel_id, None)
+                return
+            state["selected_provider"] = selected
+            state["selected_provider_name"] = str(provider.get("name") or get_label(selected) or selected)
+            menu = {"id": self._PICKER_ACTION_MODEL, "name": "Модель", "placeholder": "Модель", "options": opts}
+            extra = f"\n_{total - len(shown)} more — type `/model <name>` directly_" if total > len(shown) else ""
+            await self._update_picker_post(
+                post_id,
+                self.format_message(f"⚙ **Model Configuration**\n\nProvider: **{state['selected_provider_name']}**\nSelect a model:{extra}"),
+                self._picker_actions([menu], cancel=True))
+            logger.info("[%s] model picker: provider %s selected, %d models", self.name, selected, len(shown))
+            return
+        if action_id == self._PICKER_ACTION_MODEL and selected:
+            cb = state.get("on_model_selected")
+            provider_slug = state.get("selected_provider") or state.get("current_provider") or ""
+            self._model_picker_state.pop(channel_id, None)
+            if not cb:
+                await self._update_picker_post(post_id, "❌ Picker expired — use /model again.", [])
+                return
+            try:
+                result_text = await cb(channel_id, selected, provider_slug)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] model picker switch failed: %s", self.name, exc)
+                result_text = f"❌ Model switch failed ({exc})."
+            await self._update_picker_post(post_id, self.format_message(result_text), [])
+            logger.info("[%s] model picker: model %s chosen (provider %s)", self.name, selected, provider_slug)
+            return
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -961,6 +1135,15 @@ class MattermostAdapter(BasePlatformAdapter):
         user_name = str(data.get("user_name") or "").lstrip("@") or user_id
         if not action_id or not channel_id:
             logger.warning("Mattermost: hermes_bridge_interact missing action/channel: %s", data)
+            return
+        # /model picker menus/buttons route into the picker state machine (closed-loop with the
+        # gateway's on_model_selected), NOT into a user-visible TEXT turn. Drop only the hmp*
+        # namespace; all other interactive callbacks keep the generic TEXT path below.
+        if action_id.startswith("hmp"):
+            await self._handle_model_picker_callback({
+                "post_id": post_id, "action_id": action_id,
+                "selected_option": selected, "context": context,
+                "channel_id": channel_id, "user_id": user_id})
             return
         channel_code = await self._channel_type_code(channel_id)
         source = self.build_source(
