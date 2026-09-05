@@ -13,11 +13,33 @@ behind NAT:
 The plugin holds **no command logic**. It is a dumb receiver/relay: Hermes owns the
 single command registry (mirrors Slack's `_command_handler_table`) and pushes it here
 by REST; the plugin `RegisterCommand`s each entry and forwards invocations verbatim.
-Routing "whose channel → which bot replies" happens on the Hermes host (broadcast by
-`UserId` makes events non-racy).
+Routing "whose channel → which bot replies" happens on the Hermes host. WS broadcasts
+are addressed **by channel** (`broadcast.ChannelId`), never a hard-coded bot: any bot
+serving that channel's conversation picks the event up and Hermes-side routing decides
+who answers (per `design/mattermost-plugin-transport.md`).
 
 See `design/mattermost-plugin-transport.md` (repo root) for the full transport/protocol
 design and decisions (registry channel = REST; shared registry; no event queue).
+
+## Command registry auto-sync (Hermes side)
+
+`../bridge_registry.py` gathers gateway-usable slash commands from
+`hermes_cli.commands.COMMAND_REGISTRY`, namespaces each with a configurable prefix
+(default `hermes:`, so they never collide with built-in Mattermost commands like
+`/help` or `/status`), and pushes them to the plugin's `/config` REST endpoint **once
+at gateway connect** (best-effort, fail-open — a failed sync never blocks startup).
+
+- Config: `mattermost.bridge_command_prefix` (default `hermes`),
+  `mattermost.bridge_shared_secret` (required to enable sync), and
+  `mattermost.bridge_plugin_path` (default `plugins/hermes-bridge/config`). Brinded
+  through `_YAML_BRIDGE`/env (`MATTERMOST_BRIDGE_COMMAND_PREFIX`, `_BRIDGE_SECRET`,
+  `_BRIDGE_PLUGIN_PATH`).
+- On inbound, `_handle_bridge_command` strips the namespace prefix so the runner
+  dispatches the canonical name (`hermes:new` → `/new`).
+- `cli_only` commands (without a `gateway_config_gate`) are skipped; aliases are not
+  emitted (they reuse the same handler via the dispatch table).
+- Registry sync is idempotent: `POST /config` with `replace:true` overwrites the
+  plugin's command set (single source of truth = the Hermes registry).
 
 ## Layout (Mattermost plugin convention)
 
@@ -58,7 +80,9 @@ The bundle (root folder `hermes-bridge/` + `plugin.json`) is installable via
   `p.API.GetChannel(args.ChannelId)` (its `Type` field) and `user_name` via
   `p.API.GetUser(args.UserId)`. Thread-root id is `args.RootId`.
 - **`PublishWebSocketEvent(event string, data map[string]any, broadcast *model.WebsocketBroadcast)`**.
-  Target one bot with `&model.WebsocketBroadcast{UserId: <bot_user_id>}`.
+  Target all bots in a channel with `&model.WebsocketBroadcast{ChannelId: <channel_id>}`
+  (this plugin addresses by channel, not by a single `UserId`, so routing stays
+  Hermes-side).
 - **Registry API**: `RegisterCommand(*model.Command) error`, `UnregisterCommand(teamID,
   trigger string) error`. `Command.Method` must be `model.CommandMethodPost` ("P") for
   plugin slash commands. `UnregisterCommand` is **per-team** — pass the teamID the
