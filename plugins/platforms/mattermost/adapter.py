@@ -795,11 +795,78 @@ class MattermostAdapter(BasePlatformAdapter):
         else:
             logger.debug("Mattermost: no runner to stage reaction sidecar note (session=%s)", session_key)
 
+    async def _handle_bridge_command(self, data: Dict[str, Any]) -> None:
+        """Handle a `hermes_bridge_command` WS event from the native plugin.
+
+        The plugin relays a user-invoked slash command as a custom WS event
+        (addressable to this bot via broadcast.UserId). Build a real
+        ``MessageEvent.COMMAND`` (text ``/trigger args``) and feed it through the
+        same ``handle_message`` path as a typed post, so the existing slash
+        dispatcher owns routing and guard bypass for control commands.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType
+        trigger = str(data.get("trigger") or "").strip().lstrip("/")
+        args = str(data.get("args") or "").strip()
+        channel_id = str(data.get("channel_id") or "").strip()
+        channel_code = str(data.get("channel_type") or "") or await self._channel_type_code(channel_id)
+        user_id = str(data.get("user_id") or "").strip()
+        user_name = str(data.get("user_name") or "").lstrip("@") or user_id
+        thread_id = str(data.get("thread_id") or "").strip() or None
+        post_id = str(data.get("post_id") or "").strip() or None
+        if not trigger or not channel_id:
+            logger.warning("Mattermost: hermes_bridge_command missing trigger/channel: %s", data)
+            return
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
+            user_id=user_id, user_name=user_name,
+            thread_id=thread_id, message_id=post_id)
+        text = f"/{trigger} {args}" if args else f"/{trigger}"
+        logger.info("Mattermost: bridge command /%s from %s in %s", trigger, user_name, channel_id)
+        await self.handle_message(MessageEvent(
+            text=text, message_type=MessageType.COMMAND, source=source, message_id=post_id))
+
+    async def _handle_bridge_interact(self, data: Dict[str, Any]) -> None:
+        """Handle a `hermes_bridge_interact` WS event from the native plugin.
+
+        The plugin relays an interactive callback (button/menu/dialog) as a
+        custom WS event. Reconstruct the post context and surface the action to
+        the agent as a COMMAND-style signal the running handler can resolve.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType
+        raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+        raw = raw or {}
+        post_id = str(raw.get("post_id") or data.get("post_id") or "").strip()
+        action_id = str(raw.get("action_id") or data.get("action_id") or "").strip()
+        channel_id = str(raw.get("channel_id") or data.get("channel_id") or "").strip()
+        user_id = str(raw.get("user_id") or data.get("user_id") or "").strip()
+        user_name = str(raw.get("user_name") or "").lstrip("@") or user_id
+        thread_id = str(data.get("thread_id") or "").strip() or None
+        channel_code = str(data.get("channel_type") or "") or (await self._channel_type_code(channel_id) if channel_id else "")
+        if not action_id or not channel_id:
+            logger.warning("Mattermost: hermes_bridge_interact missing action/channel: %s", data)
+            return
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
+            user_id=user_id, user_name=user_name,
+            thread_id=thread_id, message_id=post_id)
+        text = f"/{action_id}"
+        logger.info("Mattermost: bridge interact %s from %s in %s", action_id, user_name, channel_id)
+        await self.handle_message(MessageEvent(
+            text=text, message_type=MessageType.COMMAND, source=source, message_id=post_id))
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")
         if evt_kind == "reaction_added":
             if self._read_reactions:
                 await self._handle_reaction_event(event.get("data", {}))
+            return
+        if evt_kind == "hermes_bridge_command":
+            await self._handle_bridge_command(event.get("data", {}))
+            return
+        if evt_kind == "hermes_bridge_interact":
+            await self._handle_bridge_interact(event.get("data", {}))
             return
         if evt_kind != "posted":
             return

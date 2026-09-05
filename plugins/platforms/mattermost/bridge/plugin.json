@@ -21,6 +21,14 @@
                 "help_text": "Shared secret that must match the value kept by the Hermes host so the command-registry endpoint can be authenticated.",
                 "placeholder": "",
                 "default": ""
+            },
+            {
+                "key": "BotUserID",
+                "display_name": "Bot user ID",
+                "type": "text",
+                "help_text": "Mattermost user ID of the Hermes bot that should receive plugin WS events (slash commands and interactive actions).",
+                "placeholder": "",
+                "default": ""
             }
         ]
     }

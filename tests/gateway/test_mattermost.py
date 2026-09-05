@@ -916,3 +916,87 @@ class TestMattermostTriggeringPostId:
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
         event = MessageEvent(text="hi", message_type=MessageType.TEXT, source=source, message_id=None)
         assert GatewayInboundMixin._prepend_inbound_reply_context(event, source, "hi") == "hi"
+
+
+# ---------------------------------------------------------------------------
+# Native hermes-bridge WS events: slash commands & interactive actions
+# (plugins/platforms/mattermost/bridge) relayed into MessageEvent.COMMAND
+# ---------------------------------------------------------------------------
+
+class TestMattermostBridgeEvents:
+
+    def _bridge_adapter(self, **extra):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(
+            enabled=True, token="test-token",
+            extra={"url": "https://mm.example.com", **extra},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a._channel_type_code = AsyncMock(return_value="O")
+        a.handle_message = AsyncMock()
+        return a
+
+    def _cmd_evt(self, **over):
+        data = {
+            "trigger": "new", "args": "brief", "channel_id": "chan_9",
+            "channel_type": "O", "user_id": "alice", "user_name": "@alice",
+            "thread_id": "", "response_url": "",
+        }
+        data.update(over)
+        return {"event": "hermes_bridge_command", "data": data}
+
+    @pytest.mark.asyncio
+    async def test_bridge_command_builds_command_event(self):
+        a = self._bridge_adapter()
+        await a._handle_ws_event(self._cmd_evt())
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.message_type == MessageType.COMMAND
+        assert msg.text == "/new brief"
+        assert msg.source.chat_id == "chan_9"
+        assert msg.source.chat_type == "channel"
+        assert msg.source.user_id == "alice"
+
+    @pytest.mark.asyncio
+    async def test_bridge_command_without_args(self):
+        a = self._bridge_adapter()
+        await a._handle_ws_event(self._cmd_evt(args="", trigger="stop"))
+        msg = a.handle_message.await_args.args[0]
+        assert msg.text == "/stop"
+
+    @pytest.mark.asyncio
+    async def test_bridge_command_missing_channel_dropped(self):
+        a = self._bridge_adapter()
+        await a._handle_ws_event(self._cmd_evt(channel_id=""))
+        a.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bridge_command_dm_resolves_channel_type(self):
+        """No channel_type in payload → adapter resolves via API (D = dm session key)."""
+        a = self._bridge_adapter()
+        a._channel_type_code = AsyncMock(return_value="D")
+        a._api_get = AsyncMock(return_value={"type": "D"})
+        await a._handle_ws_event(self._cmd_evt(channel_type=""))
+        msg = a.handle_message.await_args.args[0]
+        assert msg.source.chat_type == "dm"
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_builds_command_event(self):
+        a = self._bridge_adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "raw": {"post_id": "post_1", "action_id": "approve",
+                    "channel_id": "chan_9", "user_id": "bob"},
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.message_type == MessageType.COMMAND
+        assert msg.text == "/approve"
+        assert msg.source.user_id == "bob"
+
+    @pytest.mark.asyncio
+    async def test_unknown_ws_event_still_ignored(self):
+        a = self._bridge_adapter()
+        await a._handle_ws_event({"event": "whatever_new", "data": {}})
+        a.handle_message.assert_not_called()
