@@ -858,14 +858,20 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")
+        # Custom plugin WS events arrive namespaced by the server:
+        # custom_<plugin_id>_<event> (e.g. custom_hermes-bridge_hermes_bridge_command).
         if evt_kind == "reaction_added":
             if self._read_reactions:
                 await self._handle_reaction_event(event.get("data", {}))
             return
-        if evt_kind == "hermes_bridge_command":
+        bridge_command = evt_kind and (evt_kind == "hermes_bridge_command"
+                                       or evt_kind.endswith("_hermes_bridge_command"))
+        bridge_interact = evt_kind and (evt_kind == "hermes_bridge_interact"
+                                        or evt_kind.endswith("_hermes_bridge_interact"))
+        if bridge_command:
             await self._handle_bridge_command(event.get("data", {}))
             return
-        if evt_kind == "hermes_bridge_interact":
+        if bridge_interact:
             await self._handle_bridge_interact(event.get("data", {}))
             return
         if evt_kind != "posted":

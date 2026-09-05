@@ -996,6 +996,16 @@ class TestMattermostBridgeEvents:
         assert msg.source.user_id == "bob"
 
     @pytest.mark.asyncio
+    async def test_bridge_command_namespaced_prefix_still_hits(self):
+        """Server namespaces plugin events as custom_<plugin_id>_<event>."""
+        a = self._bridge_adapter()
+        await a._handle_ws_event({"event": "custom_hermes-bridge_hermes_bridge_command", "data": self._cmd_evt()["data"]})
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.text == "/new brief"
+        assert msg.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
     async def test_unknown_ws_event_still_ignored(self):
         a = self._bridge_adapter()
         await a._handle_ws_event({"event": "whatever_new", "data": {}})

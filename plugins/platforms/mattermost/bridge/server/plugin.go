@@ -27,7 +27,9 @@ type Bridge struct {
 type configuration struct {
 	// SharedSecret must match the one kept by the Hermes host so the
 	// command-registry REST endpoint (/plugins/<id>/config) is authenticated.
-	SharedSecret string `json:"shared_secret"`
+	// Field name must equal the settings_schema key (Mattermost stores the
+	// value under "SharedSecret" and LoadPluginConfiguration matches by name).
+	SharedSecret string
 }
 
 // CommandSpec is a registry entry Hermes pushes to the plugin.
@@ -88,6 +90,11 @@ func (p *Bridge) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		"thread_id":    args.RootId,
 		"response_url": "", // async replies go out via the bot's own delivery
 	}
+	p.API.LogInfo("hermes-bridge ExecuteCommand",
+		"trigger", trigger,
+		"channel_id", args.ChannelId,
+		"channel_type", channelType,
+		"target_channel_broadcast", true)
 	target := &model.WebsocketBroadcast{ChannelId: args.ChannelId}
 	p.API.PublishWebSocketEvent(wsExitCommand, payload, target)
 

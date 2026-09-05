@@ -20,9 +20,9 @@ server:
 
 bundle:
 	rm -rf dist
-	mkdir -p dist/$(PLUGIN_ID)
+	mkdir -p dist/$(PLUGIN_ID)/server
 	cp plugin.json dist/$(PLUGIN_ID)/
-	cp -r server/dist dist/$(PLUGIN_ID)/server
+	cp -r server/dist dist/$(PLUGIN_ID)/server/
 	cd dist && tar -czf $(BUNDLE_NAME) $(PLUGIN_ID)
 
 dist: server bundle
