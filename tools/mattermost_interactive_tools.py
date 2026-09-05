@@ -54,6 +54,14 @@ def send_interactive_message(args: dict, **kw) -> str:
         th = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
         if th:
             thread_id = th
+    # In a DM/plain channel there is no thread root — inherit the message being
+    # answered so buttons post as a reply, not as a brand-new root post.
+    reply_to = thread_id
+    if not reply_to:
+        from gateway.session_context import get_session_env as _gse
+        mid = (_gse("HERMES_SESSION_MESSAGE_ID", "") or "").strip()
+        if mid:
+            reply_to = mid
     _, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error("Interactive messages require a live mattermost adapter "
@@ -68,7 +76,7 @@ def send_interactive_message(args: dict, **kw) -> str:
             return await _dispatch_on_gateway_loop(
                 _live_adapter(platform)[0],
                 lambda: send_fn(chat_id=chat_id, text=text, buttons=buttons, menu=menu,
-                                reply_to=thread_id),
+                                reply_to=reply_to),
                 "mattermost_interact: failed to schedule send_interactive on gateway loop")
 
         result = _run_async(_coro())

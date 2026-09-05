@@ -1257,3 +1257,33 @@ def test_send_interactive_tool_inherits_session_thread():
     assert res.get("success") is True
     assert captured["reply_to"] == "thr_root_1"
     assert captured["chat_id"] == "chan_9"
+
+
+def test_send_interactive_tool_inherits_dm_message_when_no_thread():
+    """In a DM there is no thread root — the bot replies to the message being
+    answered (message_id) instead of creating a brand-new root post."""
+    from tools import mattermost_interactive_tools as mit
+    import gateway.session_context as sc
+    captured = {}
+
+    class FakeAdapter:
+        async def send_interactive(self, **kw):
+            captured.update(kw)
+            return type("R", (), {"success": True, "message_id": "post_x", "error": None})()
+
+    fake_runner = object()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(mit, "_live_adapter", lambda p: (fake_runner, FakeAdapter()))
+    monkeypatch.setattr(
+        mit, "_dispatch_on_gateway_loop",
+        lambda runner, make_coro, *a, **k: make_coro())
+    tokens = sc.set_session_vars(thread_id="", message_id="dm_last_post")
+    try:
+        out = mit.send_interactive_message({"target": "mattermost:chan_9", "text": "Pick", "buttons": []})
+    finally:
+        sc.clear_session_vars(tokens)
+        monkeypatch.undo()
+    res = json.loads(out)
+    assert res.get("success") is True
+    assert captured["reply_to"] == "dm_last_post"
+    assert captured["chat_id"] == "chan_9"
