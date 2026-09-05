@@ -2,6 +2,7 @@
 import json
 import os
 import time
+import asyncio
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -1027,6 +1028,45 @@ class TestMattermostBridgeEvents:
         a = self._bridge_adapter()
         await a._handle_ws_event({"event": "whatever_new", "data": {}})
         a.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bridge_control_command_bypasses_active_session_guard(self):
+        """A control command (/stop, /new) arriving over the bridge while the
+        session is busy MUST be dispatched inline, never queued as pending —
+        otherwise it leaks as user text or deadlocks (gateway invariant, #4926)."""
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        a = self._bridge_adapter(bridge_command_prefix="hermes")
+        # Restore the REAL handle_message (the helper installs an AsyncMock stub,
+        # which bypasses the active-session guard logic we're testing).
+        from gateway.platforms.base import BasePlatformAdapter
+        a.handle_message = BasePlatformAdapter.handle_message.__get__(a, type(a))
+        # Real handler that records how the command reached the runner.
+        dispatched = []
+        async def _handler(event):
+            dispatched.append((event.get_command(), event.text))
+            return ""
+        a._message_handler = _handler
+        a._busy_session_handler = None
+        a._busy_text_mode = ""
+        a._pending_messages = {}
+
+        # Establish the session key (no message_id — matches the bridge event),
+        # then simulate the agent is busy on it.
+        src = SessionSource(platform=Platform.MATTERMOST, chat_id="chan_9",
+                            chat_type="dm", user_id="alice")
+        busy = MessageEvent(text="placeholder", message_type=MessageType.TEXT, source=src)
+        key = a._event_session_key(busy)
+        a._active_sessions = {key: asyncio.Event()}
+
+        await a._handle_ws_event({"event": "hermes_bridge_command",
+                          "data": self._cmd_evt(trigger="hermes:stop", channel_type="D", args="")["data"]})
+
+        # Must have been dispatched inline (bypass), NOT queued.
+        assert a._pending_messages == {}
+        assert dispatched == [("stop", "/stop")]
 
 
 # ---------------------------------------------------------------------------
