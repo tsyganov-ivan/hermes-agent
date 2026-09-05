@@ -410,7 +410,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 })
         if not actions:
             return SendResult(success=False, error="send_interactive: no valid actions")
-        base: Dict[str, Any] = {"channel_id": chat_id, "message": text}
+        base: Dict[str, Any] = {"channel_id": chat_id, "message": ""}
         payload = _with_mentions_disabled(base)
         payload["props"] = {**(payload.get("props") or {}),
                             "attachments": [{"text": text, "actions": actions}]}

@@ -1196,7 +1196,11 @@ class TestMattermostInteractiveSend:
         assert res.success is True
         path, payload = a._api_post.call_args.args
         assert path == "posts"
+        # Text must appear only in the attachment card, never duplicated as the
+        # post message too (else the question renders twice).
+        assert payload["message"] == ""
         attach = payload["props"]["attachments"][0]
+        assert attach["text"] == "Pick one"
         actions = attach["actions"]
         assert len(actions) == 2
         btn = actions[0]
