@@ -229,48 +229,53 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 	jsonOk(w, map[string]any{"ok": true})
 }
 
-// interactUpdatePost returns a modified copy of the post with the interactive
-// attachments' actions cleared, so a picked button/menu cannot be re-chosen.
-// The message is left intact; the selection is recorded in the post props so the
-// agent can see it without parsing transport details.
-func (p *Bridge) interactUpdatePost(postID, selected string) map[string]any {
+// interactUpdatePost returns an updated post with the interactive actions
+// cleared (buttons/menus disappear, no second choice) while keeping the original
+// question text and appending the chosen answer. The selection is also recorded
+// in post props so the agent can read it without parsing transport details.
+func (p *Bridge) interactUpdatePost(postID, selected string) *model.Post {
 	post, err := p.client.Post.GetPost(postID)
 	if err != nil || post == nil {
 		return nil
 	}
+	updated := post.Clone()
 	srcProps := post.GetProps()
 	props := make(map[string]any, len(srcProps))
 	for k, v := range srcProps {
 		props[k] = v
 	}
 	attachments, _ := props["attachments"].([]any)
-	if len(attachments) == 0 {
-		return nil
-	}
-	stripped := make([]any, 0, len(attachments))
-	for _, a := range attachments {
-		am, ok := a.(map[string]any)
-		if !ok {
-			stripped = append(stripped, a)
-			continue
+	if len(attachments) > 0 {
+		stripped := make([]any, 0, len(attachments))
+		for _, a := range attachments {
+			am, ok := a.(map[string]any)
+			if !ok {
+				stripped = append(stripped, a)
+				continue
+			}
+			cp := make(map[string]any, len(am))
+			for k, v := range am {
+				cp[k] = v
+			}
+			delete(cp, "actions")
+			stripped = append(stripped, cp)
 		}
-		copy := map[string]any{}
-		for k, v := range am {
-			copy[k] = v
-		}
-		delete(copy, "actions")
-		stripped = append(stripped, copy)
+		props["attachments"] = stripped
+	} else {
+		delete(props, "attachments")
 	}
-	props["attachments"] = stripped
 	if selected != "" {
 		props["selected"] = selected
 	}
-	return map[string]any{
-		"props":     props,
-		"message":   post.Message,
-		"hashtags":  post.Hashtags,
-		"signature": "mattermost-bridge",
+	updated.SetProps(props)
+	if selected != "" {
+		base := post.Message
+		if strings.TrimSpace(base) == "" {
+			base = "Выбор"
+		}
+		updated.Message = base + "\n\n**Выбрано:** " + selected
 	}
+	return updated
 }
 
 func main() {
