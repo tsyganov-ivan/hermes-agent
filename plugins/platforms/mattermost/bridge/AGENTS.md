@@ -5,7 +5,7 @@ same package (`../adapter.py`). It runs *inside* the Mattermost server (installe
 via the admin bot token — no SSH) and relays UI inputs to the Hermes bot that stays
 behind NAT:
 
-- **Slash commands** → `ExecuteCommand` hook → `PublishWebSocketEvent("hermes_bridge_command", …, broadcast={UserId: bot})`.
+- **Slash commands** → `ExecuteCommand` hook → `PublishWebSocketEvent("hermes_bridge_command", …, broadcast={ChannelId})` targeting the channel the command ran in.
 - **Buttons/menus/dialogs** → MM server POSTs locally to `/plugins/<plugin_id>/…` →
   `ServeHTTP` → `PublishWebSocketEvent("hermes_bridge_interact", …)`.
 - **Command registry** → Hermes `POST /plugins/<plugin_id>/config` with `Authorization: Bearer <shared_secret>`.

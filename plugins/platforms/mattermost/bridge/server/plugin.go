@@ -28,11 +28,6 @@ type configuration struct {
 	// SharedSecret must match the one kept by the Hermes host so the
 	// command-registry REST endpoint (/plugins/<id>/config) is authenticated.
 	SharedSecret string `json:"shared_secret"`
-	// BotUserID names the MM user owning the Hermes bot that should receive the
-	// custom WS events. The plugin addresses broadcasts to it (broadcast.UserId
-	// = BotUserID) so the event reaches exactly that Hermes gateway — not the
-	// invoking human user.
-	BotUserID string `json:"bot_user_id"`
 }
 
 // CommandSpec is a registry entry Hermes pushes to the plugin.
@@ -93,23 +88,13 @@ func (p *Bridge) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		"thread_id":    args.RootId,
 		"response_url": "", // async replies go out via the bot's own delivery
 	}
-	target := p.broadcastToBot()
+	target := &model.WebsocketBroadcast{ChannelId: args.ChannelId}
 	p.API.PublishWebSocketEvent(wsExitCommand, payload, target)
 
 	return &model.CommandResponse{
 		ResponseType: model.CommandResponseTypeEphemeral,
 		Text:         "Запрос отправлен боту.",
 	}, nil
-}
-
-// broadcastToBot returns a WebsocketBroadcast addressing the Hermes bot (from
-// config.BotUserID). With no configured bot user, the event is broadcast to all
-// listeners (null only as a fallback for misconfiguration).
-func (p *Bridge) broadcastToBot() *model.WebsocketBroadcast {
-	if p.cfg != nil && p.cfg.BotUserID != "" {
-		return &model.WebsocketBroadcast{UserId: p.cfg.BotUserID}
-	}
-	return &model.WebsocketBroadcast{}
 }
 
 // ServeHTTP handles interactive callbacks (buttons/menus/dialogs) delivered
@@ -180,7 +165,17 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 	}
 	var raw map[string]any
 	_ = json.Unmarshal(body, &raw)
-	p.API.PublishWebSocketEvent(wsExitInteract, map[string]any{"raw": raw}, p.broadcastToBot())
+	// The channel is carried in the interactive-callback payload (post/action
+	// context). Query param is a fallback.
+	channelID, _ := raw["channel_id"].(string)
+	if channelID == "" {
+		channelID = r.URL.Query().Get("channel_id")
+	}
+	broadcast := &model.WebsocketBroadcast{}
+	if channelID != "" {
+		broadcast.ChannelId = channelID
+	}
+	p.API.PublishWebSocketEvent(wsExitInteract, map[string]any{"raw": raw}, broadcast)
 	jsonOk(w, map[string]any{"ok": true})
 }
 
