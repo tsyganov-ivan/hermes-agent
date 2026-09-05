@@ -335,6 +335,30 @@ class MattermostAdapter(BasePlatformAdapter):
             return {"success": False, "error": self._last_post_error or f"HTTP {self._last_post_status}"}
         return {"success": True}
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a post (DELETE /api/v4/posts/{post_id}). True on 2xx; callers leave
+        deletions they can't perform (base stream/fresh-final cleanup + ephemeral TTL
+        degrade gracefully). Written as a self-contained request rather than via ``_api``
+        because the shared helper collapses a successful empty 200 and a >=400 error to
+        ``{}`` and only tracks status for POST — a DELETE here must tell success from
+        failure to honour the bool contract of ``BasePlatformAdapter.delete_message``.
+        """
+        import aiohttp
+        if not message_id:
+            return False
+        url = f"{self._base_url}/api/v4/posts/{message_id}"
+        try:
+            async with self._session.delete(url, headers=self._headers(),
+                                            timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM delete post %s -> %s: %s", message_id, resp.status, body[:200])
+                    return False
+                return True
+        except aiohttp.ClientError as exc:
+            logger.error("MM delete post %s network error: %s", message_id, exc)
+            return False
+
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
         body = (self._last_post_error or "").lower()
