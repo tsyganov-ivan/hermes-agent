@@ -359,6 +359,32 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("MM delete post %s network error: %s", message_id, exc)
             return False
 
+    async def pin_message(self, chat_id: str, message_id: str) -> Dict[str, Any]:
+        """Pin a post (POST /api/v4/posts/{post_id}/pin). Returns {success, ...}.``
+        ``_last_post_status``/``_last_post_error`` are only recorded for POST, which is
+        exactly the verb used here, so a failure is reported honestly, never as success.
+        """
+        if not message_id:
+            return {"success": False, "error": "pin_message requires message_id"}
+        data = await self._api_post(f"posts/{message_id}/pin", {})
+        if not data:
+            error = self._last_post_error or (
+                f"pin failed (HTTP {self._last_post_status})" if self._last_post_status else "pin rejected")
+            return {"success": False, "error": error.strip()}
+        return {**data, "success": True}
+
+    async def unpin_message(self, chat_id: str, message_id: str) -> Dict[str, Any]:
+        """Unpin a post (DELETE /api/v4/posts/{post_id}/pin); empty-200 success mirrors
+        ``remove_reaction`` (a successful DELETE returns an empty body → ``{}``)."""
+        if not message_id:
+            return {"success": False, "error": "unpin_message requires message_id"}
+        result = await self._api("DELETE", f"posts/{message_id}/pin")
+        if result is not None and result:
+            return {**result, "success": True}
+        if self._last_post_status is not None and self._last_post_status >= 400:
+            return {"success": False, "error": self._last_post_error or f"HTTP {self._last_post_status}"}
+        return {"success": True}
+
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
         body = (self._last_post_error or "").lower()
