@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
@@ -21,6 +22,15 @@ type Bridge struct {
 	client   *pluginapi.Client
 	cfg      *configuration
 	registry []CommandSpec // commands this plugin currently owns (last-wins)
+
+	// Interactive form state for multi-control posts (buttons + select menus).
+	// keyed by post_id → action_id → selected value. A post with a single action
+	// is a final choice and is NOT stored here (it is redraw-disabled instead).
+	// Guarded by mu. This makes the plugin stateful FOR FORMS ONLY — it never
+	// interprets what an agent will do, it just accumulates selections so a
+	// multi-control post can redraw (show progress) without wiping other fields.
+	mu        sync.Mutex
+	formState map[string]map[string]string // post_id -> action_id -> selected
 }
 
 // configuration mirrors the server-side plugin settings.
@@ -49,6 +59,12 @@ type registryPayload struct {
 const (
 	wsExitCommand  = "hermes_bridge_command"
 	wsExitInteract = "hermes_bridge_interact"
+	wsExitDialog   = "hermes_bridge_dialog"
+
+	// dialogURL is where the MM server will POST the SubmitDialogRequest when the
+	// user submits an opened dialog. Must match this plugin's id in plugin.json
+	// (the server resolves /plugins/<id>/<path> locally into ServeHTTP).
+	dialogURL = "/plugins/hermes-bridge/dialog"
 )
 
 func (p *Bridge) OnConfigurationChange() error {
@@ -121,6 +137,13 @@ func (p *Bridge) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 			return
 		}
 		p.handleInteract(w, r)
+	case "/dialog":
+		// Interactive-dialog submission (SubmitDialogRequest) delivered locally.
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "POST only")
+			return
+		}
+		p.handleDialogSubmit(w, r)
 	default:
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "POST only")
@@ -185,6 +208,17 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
+
+	// Dialog trigger: if the button's integration.context carries a "dialog"
+	// schema, this click means "open the form" — not a choice. Open the dialog
+	// (trigger_id > server renders the modal) and relay nothing more as a choice;
+	// the eventual SubmitDialogRequest arrives separately at /dialog. The plugin
+	// stays a dumb relay: the full Dialog schema came from Hermes inside context.
+	if dialogRaw, ok := req.Context["dialog"]; ok && dialogRaw != nil {
+		p.handleDialogOpen(w, &req, dialogRaw)
+		return
+	}
+
 	// The action identity lives in the integration context we attached when the
 	// post was created (the bot puts {action_id, ...} there). Menus add
 	// selected_option. Fall back to a type marker when context is empty.
@@ -198,7 +232,15 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 			selected = lbl
 		}
 	}
+	isSubmit := false
+	if sb, ok := req.Context["submit"].(bool); ok && sb {
+		isSubmit = true
+	}
 
+	// Always relay the accumulated form state for this post (all controls), so the
+	// agent sees progress across clicks. On a submit action the agent ALSO gets the
+	// full submission as a single map (all selected values).
+	formState := p.snapshotFormState(req.PostId)
 	payload := map[string]any{
 		"action_id":       actionID,
 		"selected_option": selected,
@@ -212,28 +254,322 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		"trigger_id":      req.TriggerId,
 		"type":            req.Type,
 		"data_source":     req.DataSource,
+		"form_state":      formState,
 	}
-	log.Printf("hermes-bridge interact action=%s user=%s channel=%s", actionID, req.UserId, req.ChannelId)
+	if isSubmit {
+		payload["submission"] = formState
+	}
+	log.Printf("hermes-bridge interact action=%s submit=%t user=%s channel=%s",
+		actionID, isSubmit, req.UserId, req.ChannelId)
 	p.API.PublishWebSocketEvent(wsExitInteract, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
 
-	// After the user picks, replace the buttons with a compact confirmation so no
-	// second choice is possible. This is pure transport: the plugin does not know
-	// what the agent will do with the selection, it just disables the interactive UI.
+	// Submit: the form is complete — disable every control (final answer delivered).
+	// Normal click: accumulate + redraw by state, keeping every other control live.
 	if req.PostId != "" {
-		if updated := p.interactUpdatePost(req.PostId, selected); updated != nil {
-			jsonOk(w, map[string]any{"ok": true, "update": updated})
+		if isSubmit {
+			// Complete: show ALL accumulated values and disable every action.
+			if updated := p.interactRedrawFinal(req.PostId); updated != nil {
+				if err := p.client.Post.UpdatePost(updated); err != nil {
+					log.Printf("hermes-bridge interact: update post failed: %v", err)
+				}
+			}
 			return
+		}
+		single := p.postIsSingleAction(req.PostId)
+		if single {
+			// Final single choice → disable-after-pick (old behaviour).
+			if updated := p.interactRedrawPost(req.PostId, selected); updated != nil {
+				if err := p.client.Post.UpdatePost(updated); err != nil {
+					log.Printf("hermes-bridge interact: update post failed: %v", err)
+				}
+			}
+		} else {
+			// A multi-control form → accumulate + redraw by state (keep all controls).
+			if updated := p.interactRedrawStateful(req.PostId, actionID, selected); updated != nil {
+				if err := p.client.Post.UpdatePost(updated); err != nil {
+					log.Printf("hermes-bridge interact: update post failed: %v", err)
+				}
+			}
 		}
 	}
 	// MM requires a 200 JSON response or it shows "Action failed to execute".
 	jsonOk(w, map[string]any{"ok": true})
 }
 
-// interactUpdatePost returns an updated post with the interactive actions
-// cleared (buttons/menus disappear, no second choice) while keeping the original
-// question text and appending the chosen answer. The selection is also recorded
-// in post props so the agent can read it without parsing transport details.
-func (p *Bridge) interactUpdatePost(postID, selected string) *model.Post {
+func (p *Bridge) snapshotFormState(postID string) map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := make(map[string]string, len(p.formState[postID]))
+	for k, v := range p.formState[postID] {
+		cp[k] = v
+	}
+	return cp
+}
+
+// postIsSingleAction reports whether the post has exactly one total interactive
+// action across all attachments. Single => the click is a final choice (safe to
+// redraw-disable). Multiple => a multi-control form; the plugin must NOT redraw it.
+func (p *Bridge) postIsSingleAction(postID string) bool {
+	post, err := p.client.Post.GetPost(postID)
+	if err != nil || post == nil {
+		return false // can't tell → safer not to redraw
+	}
+	props := post.GetProps()
+	attachments, _ := props["attachments"].([]any)
+	total := 0
+	for _, a := range attachments {
+		am, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		acts, ok := am["actions"].([]any)
+		if !ok {
+			continue
+		}
+		total += len(acts)
+	}
+	return total == 1
+}
+
+// handleDialogOpen opens an interactive dialog on the clicking user's client. The
+// button's integration.context carried a "dialog" schema (posted by Hermes), which
+// is the OpenDialogRequest minus trigger_id/url — the server needs trigger_id (we
+// have it from the callback) and the local URL where the submit must come back.
+// The plugin does not interpret the schema; it decodes it verbatim and relays.
+func (p *Bridge) handleDialogOpen(w http.ResponseWriter, req *model.PostActionIntegrationRequest, dialogRaw any) {
+	dlgBytes, err := json.Marshal(dialogRaw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "encode dialog schema: "+err.Error())
+		return
+	}
+	var dlg model.Dialog
+	if err := json.Unmarshal(dlgBytes, &dlg); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad dialog schema: "+err.Error())
+		return
+	}
+	if req.TriggerId == "" {
+		writeErr(w, http.StatusBadRequest, "dialog open requires a trigger_id")
+		return
+	}
+	p.API.LogInfo("hermes-bridge open dialog", "callback_id", dlg.CallbackId,
+		"channel_id", req.ChannelId, "user_id", req.UserId)
+	appErr := p.API.OpenInteractiveDialog(model.OpenDialogRequest{
+		TriggerId: req.TriggerId,
+		URL:       dialogURL,
+		Dialog:    dlg,
+	})
+	if appErr != nil {
+		log.Printf("hermes-bridge open dialog failed: %v", appErr.Error())
+		writeErr(w, http.StatusInternalServerError, "open dialog: "+appErr.Error())
+		return
+	}
+	jsonOk(w, map[string]any{"ok": true})
+}
+
+// handleDialogSubmit receives a SubmitDialogRequest (the user submitted/cancelled a
+// dialog we opened) and relays it as a structured hermes_bridge_dialog WS event.
+// The submission map ({field_name: value}) is opaque to the plugin — Hermes owns
+// the dialog schema and interprets the fields.
+func (p *Bridge) handleDialogSubmit(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	var req model.SubmitDialogRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	userName := ""
+	if u, err := p.API.GetUser(req.UserId); err == nil {
+		userName = u.Username
+	}
+	payload := map[string]any{
+		"callback_id": req.CallbackId,
+		"state":       req.State,
+		"submission":  req.Submission,
+		"cancelled":   req.Cancelled,
+		"user_id":     req.UserId,
+		"user_name":   userName,
+		"channel_id":  req.ChannelId,
+		"team_id":     req.TeamId,
+	}
+	p.API.LogInfo("hermes-bridge dialog submit", "callback_id", req.CallbackId,
+		"cancel", req.Cancelled, "channel_id", req.ChannelId)
+	p.API.PublishWebSocketEvent(wsExitDialog, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
+	jsonOk(w, map[string]any{"ok": true})
+}
+
+// interactRedrawFinal shows all accumulated form values and clears every action
+// — used when the form's Submit button is clicked (the form is complete).
+func (p *Bridge) interactRedrawFinal(postID string) *model.Post {
+	post, err := p.client.Post.GetPost(postID)
+	if err != nil || post == nil {
+		return nil
+	}
+	updated := post.Clone()
+	srcProps := post.GetProps()
+	props := make(map[string]any, len(srcProps))
+	for k, v := range srcProps {
+		props[k] = v
+	}
+	p.mu.Lock()
+	sel := make(map[string]string, len(p.formState[postID]))
+	for k, v := range p.formState[postID] {
+		sel[k] = v
+	}
+	p.mu.Unlock()
+
+	attachments, _ := props["attachments"].([]any)
+	built := make([]any, 0, len(attachments))
+	allSel := []string{}
+	for _, a := range attachments {
+		am, ok := a.(map[string]any)
+		if !ok {
+			built = append(built, a)
+			continue
+		}
+		cp := make(map[string]any, len(am))
+		for k, v := range am {
+			cp[k] = v
+		}
+		delete(cp, "actions") // form complete → no more controls
+		base := ""
+		if s, ok := cp["text"].(string); ok {
+			if i := strings.Index(s, "\n\n**Выбор:**"); i >= 0 {
+				base = strings.TrimSpace(s[:i])
+			} else {
+				base = strings.TrimSpace(s)
+			}
+		}
+		lines := []string{}
+		for aid, v := range sel {
+			if v == "" {
+				continue
+			}
+			lines = append(lines, "**"+aid+":** "+v)
+			allSel = append(allSel, aid+"="+v)
+		}
+		txt := base
+		if len(lines) > 0 {
+			txt = base + "\n\n**Выбор:**\n" + strings.Join(lines, "\n")
+		}
+		cp["text"] = txt
+		built = append(built, cp)
+	}
+	if len(built) > 0 {
+		props["attachments"] = built
+	}
+	props["selected"] = strings.Join(allSel, "; ")
+	updated.SetProps(props)
+	return updated
+}
+
+func (p *Bridge) interactRedrawStateful(postID, actionID, selected string) *model.Post {
+	if postID == "" {
+		return nil
+	}
+	if selected != "" {
+		p.mu.Lock()
+		if p.formState == nil {
+			p.formState = make(map[string]map[string]string)
+		}
+		f := p.formState[postID]
+		if f == nil {
+			f = make(map[string]string)
+			p.formState[postID] = f
+		}
+		f[actionID] = selected
+		p.mu.Unlock()
+	}
+	post, err := p.client.Post.GetPost(postID)
+	if err != nil || post == nil {
+		return nil
+	}
+	updated := post.Clone()
+	srcProps := post.GetProps()
+	props := make(map[string]any, len(srcProps))
+	for k, v := range srcProps {
+		props[k] = v
+	}
+
+	// Snapshot the full selection state (all controls) for this post.
+	p.mu.Lock()
+	sel := make(map[string]string, len(p.formState[postID]))
+	for k, v := range p.formState[postID] {
+		sel[k] = v
+	}
+	p.mu.Unlock()
+
+	// Rebuild attachments: keep EVERY action so other controls stay live, but show
+	// each control's accumulated selection as a compact progress line. The selected
+	// values also ride props.selected so Hermes can read them without parsing the
+	// wire format.
+	attachments, _ := props["attachments"].([]any)
+	built := make([]any, 0, len(attachments))
+	allSel := []string{}
+	for _, a := range attachments {
+		am, ok := a.(map[string]any)
+		if !ok {
+			built = append(built, a)
+			continue
+		}
+		cp := make(map[string]any, len(am))
+		for k, v := range am {
+			cp[k] = v
+		}
+		base := ""
+		if s, ok := cp["text"].(string); ok {
+			// If this is not the first redraw, strip any previous progress block
+			// so we don't compound "Выбрано:" lines on every click.
+			if i := strings.Index(s, "\n\n**Выбор:**"); i >= 0 {
+				base = strings.TrimSpace(s[:i])
+			} else {
+				base = strings.TrimSpace(s)
+			}
+		}
+		lines := []string{}
+		if acts, ok := cp["actions"].([]any); ok {
+			for _, ac := range acts {
+				am2, ok := ac.(map[string]any)
+				if !ok {
+					continue
+				}
+				aid, _ := am2["id"].(string)
+				name, _ := am2["name"].(string)
+				if name == "" {
+					name = aid
+				}
+				// Mark the control's current value if one is in state.
+				if v, ok := sel[aid]; ok && v != "" {
+					lines = append(lines, "**"+name+":** "+v)
+					allSel = append(allSel, name+"="+v)
+				}
+			}
+		}
+		txt := base
+		if len(lines) > 0 {
+			txt = base + "\n\n**Выбор:**\n" + strings.Join(lines, "\n")
+		}
+		cp["text"] = txt
+		// Copy actions back unchanged — nothing removed.
+		built = append(built, cp)
+	}
+	if len(built) > 0 {
+		props["attachments"] = built
+	}
+	props["selected"] = strings.Join(allSel, "; ")
+	updated.SetProps(props)
+	return updated
+}
+
+// interactRedrawPost returns an updated post with the interactive actions cleared
+// (buttons/menus disappear, no second choice) while keeping the original question
+// and the chosen answer. The answer is appended to the attachment text (which
+// Mattermost reliably renders/saves on update) and recorded in props.selected so
+// the agent can read it without parsing transport details.
+func (p *Bridge) interactRedrawPost(postID, selected string) *model.Post {
 	post, err := p.client.Post.GetPost(postID)
 	if err != nil || post == nil {
 		return nil
@@ -245,21 +581,31 @@ func (p *Bridge) interactUpdatePost(postID, selected string) *model.Post {
 		props[k] = v
 	}
 	attachments, _ := props["attachments"].([]any)
-	if len(attachments) > 0 {
-		stripped := make([]any, 0, len(attachments))
-		for _, a := range attachments {
-			am, ok := a.(map[string]any)
-			if !ok {
-				stripped = append(stripped, a)
-				continue
-			}
-			cp := make(map[string]any, len(am))
-			for k, v := range am {
-				cp[k] = v
-			}
-			delete(cp, "actions")
-			stripped = append(stripped, cp)
+	stripped := make([]any, 0, len(attachments))
+	for _, a := range attachments {
+		am, ok := a.(map[string]any)
+		if !ok {
+			stripped = append(stripped, a)
+			continue
 		}
+		cp := make(map[string]any, len(am))
+		for k, v := range am {
+			cp[k] = v
+		}
+		delete(cp, "actions") // remove buttons/menu -> no second choice
+		if selected != "" {
+			base := ""
+			if s, ok := cp["text"].(string); ok {
+				base = s
+			}
+			if strings.TrimSpace(base) == "" {
+				base = "Выбор"
+			}
+			cp["text"] = base + "\n\n**Выбрано:** " + selected
+		}
+		stripped = append(stripped, cp)
+	}
+	if len(stripped) > 0 {
 		props["attachments"] = stripped
 	} else {
 		delete(props, "attachments")
@@ -268,13 +614,6 @@ func (p *Bridge) interactUpdatePost(postID, selected string) *model.Post {
 		props["selected"] = selected
 	}
 	updated.SetProps(props)
-	if selected != "" {
-		base := post.Message
-		if strings.TrimSpace(base) == "" {
-			base = "Выбор"
-		}
-		updated.Message = base + "\n\n**Выбрано:** " + selected
-	}
 	return updated
 }
 

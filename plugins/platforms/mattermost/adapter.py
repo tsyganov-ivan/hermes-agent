@@ -500,9 +500,13 @@ class MattermostAdapter(BasePlatformAdapter):
             if not bid:
                 continue
             blabel = str(b.get("label") or bid)
-            ctx = {"action_id": bid, "label": blabel}
+            ctx: Dict[str, Any] = {"action_id": bid, "label": blabel}
             if question_id:
                 ctx["question_id"] = question_id
+            # A button with submit:true is the form's Submit control — the plugin
+            # accumulates other controls and on this click relays the WHOLE form.
+            if b.get("submit"):
+                ctx["submit"] = True
             actions.append({
                 "id": bid, "type": "button", "name": blabel,
                 "style": str(b.get("style") or "default"),
@@ -532,6 +536,47 @@ class MattermostAdapter(BasePlatformAdapter):
             payload["root_id"] = await self._resolve_root_id(reply_to)
         result = await self._api_post("posts", payload)
         return _post_result(result, "Failed to create interactive post")
+
+    async def send_dialog(
+            self, chat_id: str, text: str, dialog: Dict[str, Any], *,
+            reply_to: Optional[str] = None,
+            question_id: Optional[str] = None,
+            button_label: Optional[str] = None,
+            metadata: _Metadata = None) -> SendResult:
+        """Send a post with a button that opens an interactive dialog on click.
+
+        The full dialog schema (``model.Dialog`` minus ``trigger_id``/``url``):
+        ``{title, callback_id, state, introduction_text, submit_label, elements:
+        [{name, display_name, type, subtype, placeholder, optional, default,
+        options:[{text,value}]}]}`` rides in the button's ``integration.context``
+        under key ``dialog``. On click the native plugin sees that key, opens the
+        dialog (via ``trigger_id``) and later relays the ``SubmitDialogRequest``
+        back as a ``hermes_bridge_dialog`` WS event. ``question_id`` is both put in
+        the button context and used as the dialog ``state`` so the submit can be
+        correlated back to this question.
+        """
+        if not dialog:
+            return SendResult(success=False, error="send_dialog requires a dialog schema")
+        bid = str(dialog.get("callback_id") or "dialog").strip() or "dialog"
+        label = str(button_label or dialog.get("submit_label") or "Заполнить форму")
+        ctx: Dict[str, Any] = {"action_id": bid}
+        if question_id:
+            ctx["question_id"] = question_id
+        if question_id and not dialog.get("state"):
+            dlg = dict(dialog)
+            dlg["state"] = question_id
+            dialog = dlg
+        ctx["dialog"] = dialog
+        payload = _with_mentions_disabled(
+            {"channel_id": chat_id, "message": "",
+             "props": {"attachments": [{"text": text, "actions": [
+                 {"id": bid, "type": "button", "name": label, "style": "primary",
+                  "integration": {"url": self._bridge_interact_url(), "context": ctx},
+                  }, ]}]}})
+        if reply_to:
+            payload["root_id"] = await self._resolve_root_id(reply_to)
+        result = await self._api_post("posts", payload)
+        return _post_result(result, "Failed to create dialog post")
 
     async def send_ephemeral(self, chat_id: str, user_id: str, text: str, *,
                              metadata: _Metadata = None) -> SendResult:
@@ -1353,15 +1398,72 @@ class MattermostAdapter(BasePlatformAdapter):
         # agent sees the picked label/value, not an invented slash command.
         label = str(context.get("label") or "").strip() if isinstance(context, dict) else ""
         question_id = str(context.get("question_id") or "").strip() if isinstance(context, dict) else ""
+        form_state = data.get("form_state")
+        if not isinstance(form_state, dict):
+            form_state = {}
+        submission = data.get("submission")
+        if not isinstance(submission, dict):
+            submission = {}
         text = selected or label or action_id
-        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r from %s in %s",
-                    action_id, selected, label, user_name, channel_id)
+        # A submit action carries the accumulated form submission for a multi-control
+        # post; include it (and the in-progress state) so the agent sees the whole
+        # form, not just the last control's value.
+        if submission:
+            text = f"[Form submitted] " + ", ".join(f"{k}={v}" for k, v in submission.items())
+        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r submit=%d from %s in %s",
+                    action_id, selected, label, 1 if submission else 0, user_name, channel_id)
         await self.handle_message(MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, message_id=post_id,
             raw_message={**context,
                          "action_id": action_id,
                          "selected_option": selected,
-                         "response_for_question_id": question_id or None}))
+                         "response_for_question_id": question_id or None,
+                         "form_state": form_state or None,
+                         "submission": submission or None}))
+
+    async def _handle_bridge_dialog(self, data: Dict[str, Any]) -> None:
+        """Handle a `hermes_bridge_dialog` WS event from the native plugin.
+
+        The user submitted/cancelled an interactive dialog the bot opened. The
+        plugin relayed the SubmitDialogRequest verbatim: callback_id, state,
+        submission ({field_name: value}), cancelled. Build a MessageEvent so the
+        agent sees the filled form as structured input in ``raw_message`` and a
+        human-readable summary in the text. ``state`` carries the bot's own
+        question_id (echoed back), ``callback_id`` names the dialog form.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType
+        channel_id = str(data.get("channel_id") or "").strip()
+        user_id = str(data.get("user_id") or "").strip()
+        user_name = str(data.get("user_name") or "").lstrip("@") or user_id
+        callback_id = str(data.get("callback_id") or "").strip()
+        state = str(data.get("state") or "").strip()
+        submission = data.get("submission")
+        cancelled = bool(data.get("cancelled"))
+        if not channel_id:
+            logger.warning("Mattermost: hermes_bridge_dialog missing channel: %s", data)
+            return
+        if not isinstance(submission, dict):
+            submission = {}
+        channel_code = await self._channel_type_code(channel_id)
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
+            user_id=user_id, user_name=user_name,
+            thread_id=None, message_id=None)
+        if cancelled:
+            text = f"[Dialog cancelled] {callback_id or 'dialog'}"
+        else:
+            items = ", ".join(f"{k}={v}" for k, v in submission.items()) if submission else "(no fields)"
+            text = f"[Dialog submitted] {callback_id or 'dialog'}: {items}"
+        logger.info("Mattermost: bridge dialog callback=%s cancelled=%s from %s in %s",
+                    callback_id, cancelled, user_name, channel_id)
+        await self.handle_message(MessageEvent(
+            text=text, message_type=MessageType.TEXT, source=source, message_id=None,
+            raw_message={"callback_id": callback_id,
+                         "state": state or None,
+                         "submission": submission,
+                         "cancelled": cancelled,
+                         "response_for_question_id": state or None}))
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")
@@ -1375,11 +1477,16 @@ class MattermostAdapter(BasePlatformAdapter):
                                        or evt_kind.endswith("_hermes_bridge_command"))
         bridge_interact = evt_kind and (evt_kind == "hermes_bridge_interact"
                                         or evt_kind.endswith("_hermes_bridge_interact"))
+        bridge_dialog = evt_kind and (evt_kind == "hermes_bridge_dialog"
+                                      or evt_kind.endswith("_hermes_bridge_dialog"))
         if bridge_command:
             await self._handle_bridge_command(event.get("data", {}))
             return
         if bridge_interact:
             await self._handle_bridge_interact(event.get("data", {}))
+            return
+        if bridge_dialog:
+            await self._handle_bridge_dialog(event.get("data", {}))
             return
         if evt_kind != "posted":
             return

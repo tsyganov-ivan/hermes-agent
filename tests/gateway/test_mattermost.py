@@ -1512,3 +1512,168 @@ class TestMattermostChoicePicker:
             "channel_id": "chan_9", "user_id": "bob", "context": {}}}
         await a._handle_ws_event(evt)
         a.handle_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Bridge: interactive dialogs (hermes_bridge_dialog WS event + send_dialog)
+# ---------------------------------------------------------------------------
+
+class TestMattermostBridgeDialog:
+
+    def _adapter(self, **extra):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(
+            enabled=True, token="test-token",
+            extra={"url": "https://mm.example.com", **extra},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a._channel_type_code = AsyncMock(return_value="O")
+        a.handle_message = AsyncMock()
+        a._api_post = AsyncMock(return_value={"id": "post_9"})
+        a._api = AsyncMock(return_value={})
+        return a
+
+    @pytest.mark.asyncio
+    async def test_bridge_dialog_submit_builds_text_event(self):
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_dialog", "data": {
+            "callback_id": "report", "state": "qid_abc",
+            "submission": {"summary": "All good", "priority": "high"},
+            "cancelled": False,
+            "user_id": "u_submit", "user_name": "sam", "channel_id": "chan_9",
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.message_type == MessageType.TEXT
+        assert "All good" in msg.text
+        assert msg.source.chat_id == "chan_9"
+        assert msg.source.user_id == "u_submit"
+        assert msg.raw_message["callback_id"] == "report"
+        assert msg.raw_message["submission"]["priority"] == "high"
+        assert msg.raw_message["response_for_question_id"] == "qid_abc"
+
+    @pytest.mark.asyncio
+    async def test_bridge_dialog_cancel_builds_text_event(self):
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_dialog", "data": {
+            "callback_id": "report", "state": "qid_abc",
+            "submission": {}, "cancelled": True,
+            "user_id": "u_submit", "user_name": "sam", "channel_id": "chan_9",
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert "cancelled" in msg.text.lower()
+        assert msg.raw_message["cancelled"] is True
+
+    @pytest.mark.asyncio
+    async def test_bridge_dialog_namespaced_prefix_still_hits(self):
+        """Server namespaces plugin events: custom_<plugin_id>_<event>."""
+        a = self._adapter()
+        evt = {"event": "custom_hermes-bridge_hermes_bridge_dialog", "data": {
+            "callback_id": "c", "submission": {"x": "1"},
+            "cancelled": False, "user_id": "u", "channel_id": "chan_9",
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bridge_dialog_missing_channel_dropped(self):
+        a = self._adapter()
+        await a._handle_ws_event({"event": "hermes_bridge_dialog", "data": {
+            "callback_id": "c", "submission": {}, "cancelled": False}})
+        a.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_dialog_posts_dialog_button(self):
+        a = self._adapter()
+        dialog = {"callback_id": "report", "title": "Report", "submit_label": "Send",
+                  "elements": [{"name": "summary", "display_name": "Summary", "type": "textarea"}]}
+        result = await a.send_dialog("chan_9", "Please report", dialog, question_id="qid_abc")
+        assert result.success
+        a._api_post.assert_awaited_once()
+        payload = a._api_post.call_args.args[1]
+        action = payload["props"]["attachments"][0]["actions"][0]
+        assert action["id"] == "report"
+        assert action["type"] == "button"
+        # The dialog schema rides in integration.context under key "dialog".
+        assert action["integration"]["context"]["dialog"]["callback_id"] == "report"
+        assert action["integration"]["context"]["dialog"]["elements"][0]["type"] == "textarea"
+        # question_id is both in the button context and used as dialog state.
+        assert action["integration"]["context"]["question_id"] == "qid_abc"
+        assert action["integration"]["context"]["dialog"]["state"] == "qid_abc"
+
+    @pytest.mark.asyncio
+    async def test_send_dialog_requires_schema(self):
+        a = self._adapter()
+        result = await a.send_dialog("chan_9", "text", {})
+        assert not result.success
+        a._api_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# bridge interact: form_state + submit accumulation
+# ---------------------------------------------------------------------------
+
+class TestMattermostInteractFormState:
+
+    def _adapter(self, **extra):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(
+            enabled=True, token="test-token",
+            extra={"url": "https://mm.example.com", **extra},
+        )
+        a = MattermostAdapter(config)
+        a._bot_user_id = "bot_id"
+        a._channel_type_code = AsyncMock(return_value="O")
+        a.handle_message = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_interact_carries_form_state(self):
+        """A normal click carries the accumulated form_state for the post."""
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "size", "selected_option": "s", "post_id": "form_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "size", "selected_option": "s"},
+            "form_state": {"size": "s"},
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert msg.raw_message["form_state"] == {"size": "s"}
+        assert msg.raw_message.get("submission") is None
+        assert msg.text == "s"  # choice text, not a fake command
+
+    @pytest.mark.asyncio
+    async def test_interact_submit_full_submission(self):
+        """A submit click relays the whole accumulated form as submission text."""
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "submit", "selected_option": "", "post_id": "form_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "submit", "label": "Готово", "submit": True},
+            "form_state": {"size": "s", "veggie": "yes"},
+            "submission": {"size": "s", "veggie": "yes"},
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert msg.raw_message["submission"] == {"size": "s", "veggie": "yes"}
+        assert msg.raw_message["form_state"] == {"size": "s", "veggie": "yes"}
+        assert "size=s" in msg.text and "veggie=yes" in msg.text
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_submit_button_sets_context_flag(self):
+        """A button marked submit:true must carry submit:true in integration.context."""
+        a = self._adapter()
+        a._session = MagicMock()
+        a._api_post = AsyncMock(return_value={"id": "p9"})
+        a._api = AsyncMock(return_value={})
+        result = await a.send_interactive(
+            "chan_9", "Выбери всё",
+            buttons=[{"id": "submit", "label": "Готово", "submit": True}],
+            menu={"id": "size", "placeholder": "Размер", "options": [{"label": "S", "value": "s"}]})
+        assert result.success
+        submit_action = a._api_post.call_args.args[1]["props"]["attachments"][0]["actions"][0]
+        assert submit_action["integration"]["context"].get("submit") is True

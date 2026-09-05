@@ -130,6 +130,68 @@ def update_message(args: dict, **kw) -> str:
     return json.dumps({"success": bool(result)})
 
 
+def send_dialog(args: dict, **kw) -> str:
+    """Send a post with a button that opens an interactive dialog on click.
+
+    The dialog schema is described by ``dialog``: {title, callback_id,
+    introduction_text, submit_label, elements: [{name, display_name, type,
+    subtype, placeholder, optional, default, options:[{text,value}]}]}.
+    Element ``type``: text|textarea|select|bool|radio|date|datetime|file. On
+    submit/cancel the agent receives a "Dialog submitted"/"Dialog cancelled"
+    message with the filled fields in raw_message. Requires a live mattermost
+    adapter.
+    """
+    target = (args.get("target") or "").strip()
+    text = (args.get("text") or "").strip()
+    dialog = args.get("dialog")
+    if not target:
+        return tool_error("'target' is required (e.g. 'mattermost:chat_id').")
+    if not isinstance(dialog, dict) or not dialog:
+        return tool_error("'dialog' (the dialog schema object) is required.")
+    platform, chat_id, thread_id = _target(target)
+    if chat_id is None:
+        return tool_error(thread_id)
+    if not thread_id:
+        from gateway.session_context import get_session_env
+        th = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+        if th:
+            thread_id = th
+    reply_to = thread_id
+    if not reply_to:
+        from gateway.session_context import get_session_env as _gse
+        mid = (_gse("HERMES_SESSION_MESSAGE_ID", "") or "").strip()
+        if mid:
+            reply_to = mid
+    _, adapter = _live_adapter(platform)
+    if adapter is None:
+        return tool_error("Dialogs require a live mattermost adapter "
+                          "(not available from cron/standalone contexts).")
+    send_fn = getattr(adapter, "send_dialog", None)
+    if not callable(send_fn):
+        return tool_error("Mattermost adapter does not support send_dialog.")
+    question_id = uuid.uuid4().hex[:12]
+    try:
+        from model_tools import _run_async
+
+        async def _coro():
+            return await _dispatch_on_gateway_loop(
+                _live_adapter(platform)[0],
+                lambda: send_fn(chat_id=chat_id, text=text, dialog=dialog,
+                                reply_to=reply_to, question_id=question_id),
+                "mattermost_dialog: failed to schedule send_dialog on gateway loop")
+
+        result = _run_async(_coro())
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"success": False, "error": f"send_dialog failed: {e}"})
+    if isinstance(result, dict):
+        result.pop("raw_response", None)
+        result["question_id"] = question_id
+        result["acknowledgment_required"] = False
+        return json.dumps(result)
+    return json.dumps({"success": bool(result), "question_id": question_id,
+                       "acknowledgment_required": False})
+
+
 def ephemeral_reply(args: dict, **kw) -> str:
     """Send a message visible only to one user in a Mattermost channel (ephemeral)."""
     target = (args.get("target") or "").strip()
@@ -199,6 +261,7 @@ registry.register(
                             "id": {"type": "string", "description": "Unique action id (returned on click)."},
                             "label": {"type": "string", "description": "Button label."},
                             "style": {"type": "string", "description": "default|primary|success|warning|danger"},
+                            "submit": {"type": "boolean", "description": "Optional. Mark this button as the form's Submit control. When buttons + menus form a multi-control form, all OTHER controls accumulate their selection in the post, and on THIS button's click the agent receives the whole form submission at once. Use when several controls make up one structured input."},
                         },
                     },
                     "description": "Optional list of buttons.",
@@ -226,6 +289,49 @@ registry.register(
         },
     },
     handler=lambda args, **kw: send_interactive_message(args, **kw),
+)
+
+registry.register(
+    name="send_dialog",
+    toolset="message_interactive",
+    schema={
+        "name": "send_dialog",
+        "description": (
+            "Send a Mattermost post with a button that opens an interactive dialog "
+            "(multi-field form) when the user clicks it. The bot provides message text "
+            "and a dialog schema object: {title, callback_id, introduction_text, "
+            "submit_label, elements:[{name, display_name, type, subtype, placeholder, "
+            "optional, default, options:[{text,value}]}]}. Element type: text|textarea|"
+            "select|bool|radio|date|datetime|file. target is 'mattermost:chat_id' "
+            "(optionally ':...thread_id' to post into a thread). When the user submits or "
+            "cancels, the agent receives the filled fields as a message ('Dialog "
+            "submitted'/'Dialog cancelled'). Use this when you need structured input the "
+            "user fills in a form, not just a single button choice. IMPORTANT: the dialog "
+            "post IS your answer — after a SUCCESSFUL send_dialog do NOT write explanatory "
+            "text; end the turn with [SILENT]."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "mattermost:chat_id of the conversation."},
+                "text": {"type": "string", "description": "Post text shown above the dialog button."},
+                "dialog": {
+                    "type": "object",
+                    "description": (
+                        "Dialog schema. {title (max 24 chars), callback_id (dialog id), "
+                        "introduction_text, submit_label (button label), elements: list of "
+                        "{name, display_name (label), type (text|textarea|select|bool|radio|"
+                        "date|datetime|file), subtype (text|email|number|password|tel|url), "
+                        "placeholder, optional (bool), default, options:[{text,value}] for "
+                        "select/radio}."
+                    ),
+                },
+                "button_label": {"type": "string", "description": "Optional label of the button that opens the dialog (default: the submit_label or 'Заполнить форму')."},
+            },
+            "required": ["target", "text", "dialog"],
+        },
+    },
+    handler=lambda args, **kw: send_dialog(args, **kw),
 )
 
 registry.register(

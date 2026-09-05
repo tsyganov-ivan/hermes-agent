@@ -6,8 +6,17 @@ via the admin bot token — no SSH) and relays UI inputs to the Hermes bot that 
 behind NAT:
 
 - **Slash commands** → `ExecuteCommand` hook → `PublishWebSocketEvent("hermes_bridge_command", …, broadcast={ChannelId})` targeting the channel the command ran in.
-- **Buttons/menus/dialogs** → MM server POSTs locally to `/plugins/<plugin_id>/…` →
+- **Buttons/menus** → MM server POSTs locally to `/plugins/<plugin_id>/interact` →
   `ServeHTTP` → `PublishWebSocketEvent("hermes_bridge_interact", …)`.
+- **Interactive dialogs** (2 hops, both dumb):
+  1. `POST /plugins/<plugin_id>/interact` with a `context.dialog` schema (posted by Hermes).
+     `handleInteract` sees the key and calls `p.API.OpenInteractiveDialog({TriggerId,
+     URL: "/plugins/hermes-bridge/dialog", Dialog: <decoded schema>})` → the modal opens
+     in the clicking user's client. No choice WS event is emitted (opening a form ≠ a choice).
+  2. On submit/cancel the MM server POSTs a `SubmitDialogRequest` to `/plugins/<plugin_id>/dialog`
+     → `handleDialogSubmit` → `PublishWebSocketEvent("hermes_bridge_dialog", …)` carrying
+     `callback_id`/`state`/`submission`/`cancelled`/user/channel. The `state` field echoes
+     Hermes' `question_id` so the submit is correlated back to the dialog.
 - **Command registry** → Hermes `POST /plugins/<plugin_id>/config` with `Authorization: Bearer <shared_secret>`.
 
 The plugin holds **no command logic**. It is a dumb receiver/relay: Hermes owns the
