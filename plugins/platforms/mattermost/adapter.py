@@ -528,6 +528,22 @@ class MattermostAdapter(BasePlatformAdapter):
                 })
         if not actions:
             return SendResult(success=False, error="send_interactive: no valid actions")
+        # Multi-control forms need an explicit Submit button — the plugin only sends
+        # the whole form to the agent on a submit:true click. Auto-append one
+        # unless the model already provided it.
+        already = any(
+            (a.get("integration") or {}).get("context", {}).get("submit")
+            for a in actions
+        )
+        if len(actions) > 1 and not already:
+            sctx: Dict[str, Any] = {"action_id": "submit_form", "label": "Готово", "submit": True}
+            if question_id:
+                sctx["question_id"] = question_id
+            actions.append({
+                "id": "submit_form", "type": "button", "name": "Готово",
+                "style": "primary",
+                "integration": {"url": "/plugins/hermes-bridge/interact", "context": sctx},
+            })
         base: Dict[str, Any] = {"channel_id": chat_id, "message": ""}
         payload = _with_mentions_disabled(base)
         payload["props"] = {**(payload.get("props") or {}),

@@ -1202,7 +1202,8 @@ class TestMattermostInteractiveSend:
         attach = payload["props"]["attachments"][0]
         assert attach["text"] == "Pick one"
         actions = attach["actions"]
-        assert len(actions) == 2
+        # Multi-control post (button + menu) → auto-append a Submit button.
+        assert len(actions) == 3
         btn = actions[0]
         assert btn["type"] == "button" and btn["id"] == "yes"
         assert btn["integration"]["url"] == "/plugins/hermes-bridge/interact"
@@ -1212,6 +1213,27 @@ class TestMattermostInteractiveSend:
         menu_action = actions[1]
         assert menu_action["type"] == "select"
         assert menu_action["options"] == [{"text": "A", "value": "a"}]
+        # Auto-added Submit button: submit:true in context so the plugin relays the
+        # whole form on its click.
+        submit = actions[2]
+        assert submit["type"] == "button" and submit["name"] == "Готово"
+        assert submit["integration"]["context"]["submit"] is True
+        assert submit["integration"]["context"]["action_id"] == "submit_form"
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_single_button_no_auto_submit(self):
+        """A single-button post is an immediate choice — no Submit appended."""
+        a = self._adapter()
+        a._session = MagicMock()
+        a._api_post = AsyncMock(return_value={"id": "p1"})
+        a._api = AsyncMock(return_value={})
+        res = await a.send_interactive(
+            "chan_9", "Да или нет", buttons=[{"id": "yes", "label": "Да"}])
+        assert res.success is True
+        actions = a._api_post.call_args.args[1]["props"]["attachments"][0]["actions"]
+        assert len(actions) == 1
+        assert actions[0]["id"] == "yes"
+        assert actions[0]["integration"]["context"].get("submit") is None
 
     @pytest.mark.asyncio
     async def test_send_interactive_requires_action(self):

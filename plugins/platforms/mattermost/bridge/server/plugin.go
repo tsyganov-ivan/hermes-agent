@@ -24,13 +24,21 @@ type Bridge struct {
 	registry []CommandSpec // commands this plugin currently owns (last-wins)
 
 	// Interactive form state for multi-control posts (buttons + select menus).
-	// keyed by post_id → action_id → selected value. A post with a single action
-	// is a final choice and is NOT stored here (it is redraw-disabled instead).
-	// Guarded by mu. This makes the plugin stateful FOR FORMS ONLY — it never
-	// interprets what an agent will do, it just accumulates selections so a
-	// multi-control post can redraw (show progress) without wiping other fields.
+	// keyed by post_id → action_id → {value, question_id}. A post with a single
+	// action is a final choice and is NOT stored here (it is redraw-disabled
+	// instead). Guarded by mu. This makes the plugin stateful FOR FORMS ONLY — it
+	// never interprets what an agent will do, it just accumulates selections so a
+	// multi-control post can redraw (show progress) without wiping other fields,
+	// and on Submit can relay every answer WITH its question_id in one submission.
 	mu        sync.Mutex
-	formState map[string]map[string]string // post_id -> action_id -> selected
+	formState map[string]map[string]formAnswer // post_id -> action_id -> answer
+}
+
+// formAnswer is one control's accumulated selection. It keeps the question_id the
+// posting bot attached (so a Submit relays each field WITH its question_id back).
+type formAnswer struct {
+	Value      string
+	QuestionID string
 }
 
 // configuration mirrors the server-side plugin settings.
@@ -239,7 +247,7 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 
 	// Always relay the accumulated form state for this post (all controls), so the
 	// agent sees progress across clicks. On a submit action the agent ALSO gets the
-	// full submission as a single map (all selected values).
+	// full submission keyed by each control's question_id (all answers, one read).
 	formState := p.snapshotFormState(req.PostId)
 	payload := map[string]any{
 		"action_id":       actionID,
@@ -257,7 +265,7 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		"form_state":      formState,
 	}
 	if isSubmit {
-		payload["submission"] = formState
+		payload["submission"] = p.snapshotSubmission(req.PostId)
 	}
 	log.Printf("hermes-bridge interact action=%s submit=%t user=%s channel=%s",
 		actionID, isSubmit, req.UserId, req.ChannelId)
@@ -285,7 +293,8 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			// A multi-control form → accumulate + redraw by state (keep all controls).
-			if updated := p.interactRedrawStateful(req.PostId, actionID, selected); updated != nil {
+			qid, _ := req.Context["question_id"].(string)
+			if updated := p.interactRedrawStateful(req.PostId, actionID, selected, qid); updated != nil {
 				if err := p.client.Post.UpdatePost(updated); err != nil {
 					log.Printf("hermes-bridge interact: update post failed: %v", err)
 				}
@@ -296,14 +305,33 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 	jsonOk(w, map[string]any{"ok": true})
 }
 
-func (p *Bridge) snapshotFormState(postID string) map[string]string {
+func (p *Bridge) snapshotFormState(postID string) map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cp := make(map[string]string, len(p.formState[postID]))
+	cp := make(map[string]any, len(p.formState[postID]))
 	for k, v := range p.formState[postID] {
-		cp[k] = v
+		cp[k] = v.Value // value by action_id (progress view)
 	}
 	return cp
+}
+
+// snapshotSubmission collects every accumulated answer for a post, keyed by the
+// question_id the posting bot attached to each control. Controls that carried no
+// question_id fall back to their action_id so the agent still gets a key. The WS
+// payload uses this on a Submit click so ALL answers arrive in one read WITH their
+// question_id (Ivan's requirement).
+func (p *Bridge) snapshotSubmission(postID string) map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]any, len(p.formState[postID]))
+	for aid, ans := range p.formState[postID] {
+		key := ans.QuestionID
+		if key == "" {
+			key = aid
+		}
+		out[key] = ans.Value
+	}
+	return out
 }
 
 // postIsSingleAction reports whether the post has exactly one total interactive
@@ -415,7 +443,7 @@ func (p *Bridge) interactRedrawFinal(postID string) *model.Post {
 		props[k] = v
 	}
 	p.mu.Lock()
-	sel := make(map[string]string, len(p.formState[postID]))
+	sel := make(map[string]formAnswer, len(p.formState[postID]))
 	for k, v := range p.formState[postID] {
 		sel[k] = v
 	}
@@ -444,12 +472,12 @@ func (p *Bridge) interactRedrawFinal(postID string) *model.Post {
 			}
 		}
 		lines := []string{}
-		for aid, v := range sel {
-			if v == "" {
+		for aid, ans := range sel {
+			if ans.Value == "" {
 				continue
 			}
-			lines = append(lines, "**"+aid+":** "+v)
-			allSel = append(allSel, aid+"="+v)
+			lines = append(lines, "**"+aid+":** "+ans.Value)
+			allSel = append(allSel, aid+"="+ans.Value)
 		}
 		txt := base
 		if len(lines) > 0 {
@@ -466,21 +494,21 @@ func (p *Bridge) interactRedrawFinal(postID string) *model.Post {
 	return updated
 }
 
-func (p *Bridge) interactRedrawStateful(postID, actionID, selected string) *model.Post {
+func (p *Bridge) interactRedrawStateful(postID, actionID, selected, questionID string) *model.Post {
 	if postID == "" {
 		return nil
 	}
 	if selected != "" {
 		p.mu.Lock()
 		if p.formState == nil {
-			p.formState = make(map[string]map[string]string)
+			p.formState = make(map[string]map[string]formAnswer)
 		}
 		f := p.formState[postID]
 		if f == nil {
-			f = make(map[string]string)
+			f = make(map[string]formAnswer)
 			p.formState[postID] = f
 		}
-		f[actionID] = selected
+		f[actionID] = formAnswer{Value: selected, QuestionID: questionID}
 		p.mu.Unlock()
 	}
 	post, err := p.client.Post.GetPost(postID)
@@ -496,7 +524,7 @@ func (p *Bridge) interactRedrawStateful(postID, actionID, selected string) *mode
 
 	// Snapshot the full selection state (all controls) for this post.
 	p.mu.Lock()
-	sel := make(map[string]string, len(p.formState[postID]))
+	sel := make(map[string]formAnswer, len(p.formState[postID]))
 	for k, v := range p.formState[postID] {
 		sel[k] = v
 	}
@@ -542,9 +570,9 @@ func (p *Bridge) interactRedrawStateful(postID, actionID, selected string) *mode
 					name = aid
 				}
 				// Mark the control's current value if one is in state.
-				if v, ok := sel[aid]; ok && v != "" {
-					lines = append(lines, "**"+name+":** "+v)
-					allSel = append(allSel, name+"="+v)
+				if v, ok := sel[aid]; ok && v.Value != "" {
+					lines = append(lines, "**"+name+":** "+v.Value)
+					allSel = append(allSel, name+"="+v.Value)
 				}
 			}
 		}
