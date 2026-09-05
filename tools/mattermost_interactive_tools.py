@@ -180,9 +180,11 @@ registry.register(
             "'mattermost:chat_id' (optionally ':...thread_id' to post into a thread). "
             "Clicks/menu selections come back to the agent as user messages. Use update_message "
             "to replace the post text afterwards, and ephemeral_reply to answer just one user. "
-            "The interactive message IS the answer — after a SUCCESSFUL send_interactive_message "
-            "do NOT write any extra explanatory text or 'done' message; the buttons you posted "
-            "are the deliverable."
+            "IMPORTANT: the interactive message IS your answer — the buttons you post are visible "
+            "to the user. After a SUCCESSFUL send_interactive_message do NOT write any "
+            "explanatory text, confirmation, or summary. End the turn by replying with exactly "
+            "[SILENT] (that single token suppresses your final message) unless you genuinely need "
+            "to add more content."
         ),
         "parameters": {
             "type": "object",
