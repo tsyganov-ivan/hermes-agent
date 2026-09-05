@@ -1,0 +1,27 @@
+{
+    "id": "hermes-bridge",
+    "name": "Hermes Bridge",
+    "description": "Relays Mattermost slash commands and interactive actions (buttons/menus/dialogs) to the Hermes agent over its outbound WebSocket, keeping Hermes behind NAT.",
+    "version": "0.1.0",
+    "min_server_version": "7.10.0",
+    "server": {
+        "executables": {
+            "linux-amd64": "server/dist/plugin-linux-amd64",
+            "linux-arm64": "server/dist/plugin-linux-arm64"
+        }
+    },
+    "settings_schema": {
+        "header": "",
+        "footer": "",
+        "settings": [
+            {
+                "key": "SharedSecret",
+                "display_name": "Shared secret",
+                "type": "text",
+                "help_text": "Shared secret that must match the value kept by the Hermes host so the command-registry endpoint can be authenticated.",
+                "placeholder": "",
+                "default": ""
+            }
+        ]
+    }
+}
