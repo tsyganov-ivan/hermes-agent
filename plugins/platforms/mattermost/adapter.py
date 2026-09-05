@@ -197,6 +197,19 @@ class MattermostAdapter(BasePlatformAdapter):
         # Reply mode: "thread" to nest replies, "off" for flat messages.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "") or _get_scoped_secret("MATTERMOST_REPLY_MODE", "off")).lower()
+        # Native hermes-bridge plugin: prefix namespaces our slash commands so they
+        # don't collide with built-in Mattermost commands. Command registry sync is
+        # off by default; enable by setting a shared secret (MATTERMOST_BRIDGE_SECRET).
+        self._bridge_prefix: str = (
+            config.extra.get("bridge_command_prefix", "")
+            or _get_scoped_secret("MATTERMOST_BRIDGE_COMMAND_PREFIX", "hermes:")).strip().rstrip(":")
+        self._bridge_secret: str = (
+            config.extra.get("bridge_shared_secret", "")
+            or _get_scoped_secret("MATTERMOST_BRIDGE_SECRET", ""))
+        self._bridge_plugin_path: str = (
+            config.extra.get("bridge_plugin_path", "")
+            or _get_scoped_secret("MATTERMOST_BRIDGE_PLUGIN_PATH",
+                                  "plugins/hermes-bridge/config"))
         # Read reactions: when true, reaction_added on the bot's own posts/threads is
         # surfaced to the agent as an internal signal (no visible reply). Default off.
         _read_rx = (config.extra.get("read_reactions", "") or _get_scoped_secret("MATTERMOST_READ_REACTIONS", "false"))
@@ -394,6 +407,13 @@ class MattermostAdapter(BasePlatformAdapter):
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._mark_connected()
         self._wire_plugin_handlers(None)  # plugin-registered native handlers
+        if not is_reconnect and self._bridge_secret:
+            # Best-effort: push the gateway command registry to the native plugin.
+            # Never blocks startup — failures only log (bridge_registry never raises).
+            try:
+                await self._sync_bridge_registry()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Mattermost: bridge registry sync errored: %s", exc)
         return True
 
     async def disconnect(self) -> None:
@@ -726,6 +746,19 @@ class MattermostAdapter(BasePlatformAdapter):
                 return code
         return "O"
 
+    async def _sync_bridge_registry(self) -> None:
+        """Push the gateway slash-command registry to the native hermes-bridge plugin."""
+        if not self._bridge_secret:
+            return
+        from plugins.platforms.mattermost import bridge_registry
+        result = await bridge_registry.push_command_registry(
+            base_url=self._base_url, shared_secret=self._bridge_secret,
+            prefix=self._bridge_prefix, plugin_path=self._bridge_plugin_path,
+            session=self._session)
+        registered = result.get("registered", "?")
+        logger.info("Mattermost: bridge registry sync -> registered %s (%s)",
+                    registered, "ok" if result.get("ok") else result.get("error", "unknown"))
+
     async def _handle_reaction_event(self, data: Dict[str, Any]) -> None:
         """Surface a `reaction_added` on the bot's own content to the agent as an internal signal.
 
@@ -806,6 +839,12 @@ class MattermostAdapter(BasePlatformAdapter):
         """
         from gateway.platforms.base import MessageEvent, MessageType
         trigger = str(data.get("trigger") or "").strip().lstrip("/")
+        # Strip the configured namespace prefix (e.g. "hermes:new" -> "new") so the
+        # dispatcher sees the canonical command name. If no prefix matches, keep as-is.
+        if self._bridge_prefix:
+            _pref = f"{self._bridge_prefix}:"
+            if trigger.startswith(_pref):
+                trigger = trigger[len(_pref):]
         args = str(data.get("args") or "").strip()
         channel_id = str(data.get("channel_id") or "").strip()
         channel_code = str(data.get("channel_type") or "") or await self._channel_type_code(channel_id)
@@ -1037,7 +1076,10 @@ _YAML_BRIDGE = (  # (yaml key, env var, yaml value → env string); allowed_chan
     ("free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", _csv),
     ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", _csv),
     ("read_reactions", "MATTERMOST_READ_REACTIONS", lambda v: str(v).lower()),
-    ("reaction_reply", "MATTERMOST_REACTION_REPLY", lambda v: str(v).lower()))
+    ("reaction_reply", "MATTERMOST_REACTION_REPLY", lambda v: str(v).lower()),
+    ("bridge_command_prefix", "MATTERMOST_BRIDGE_COMMAND_PREFIX", lambda v: str(v).strip().rstrip(":")),
+    ("bridge_shared_secret", "MATTERMOST_BRIDGE_SECRET", lambda v: str(v)),
+    ("bridge_plugin_path", "MATTERMOST_BRIDGE_PLUGIN_PATH", lambda v: str(v)))
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:

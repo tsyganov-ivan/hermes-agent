@@ -1006,7 +1006,110 @@ class TestMattermostBridgeEvents:
         assert msg.message_type == MessageType.COMMAND
 
     @pytest.mark.asyncio
+    async def test_bridge_command_strips_namespace_prefix(self):
+        """trigger 'hermes:new' (namespace prefix) must become canonical '/new'."""
+        a = self._bridge_adapter(bridge_command_prefix="hermes")
+        evt = {"event": "hermes_bridge_command", "data": self._cmd_evt(trigger="hermes:new")["data"]}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        assert a.handle_message.await_args.args[0].text == "/new brief"
+
+    @pytest.mark.asyncio
+    async def test_bridge_command_no_prefix_keeps_trigger(self):
+        a = self._bridge_adapter(bridge_command_prefix="")
+        evt = {"event": "hermes_bridge_command", "data": self._cmd_evt(trigger="customthing")["data"]}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        assert a.handle_message.await_args.args[0].text == "/customthing brief"
+
+    @pytest.mark.asyncio
     async def test_unknown_ws_event_still_ignored(self):
         a = self._bridge_adapter()
         await a._handle_ws_event({"event": "whatever_new", "data": {}})
         a.handle_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Registry sync: Hermes commands -> native plugin (with namespace prefix)
+# ---------------------------------------------------------------------------
+
+class TestMattermostBridgeRegistrySync:
+
+    def test_gateway_specs_namespaced_and_no_cli_only(self):
+        from plugins.platforms.mattermost.bridge_registry import _gateway_command_specs
+        from hermes_cli.commands import COMMAND_REGISTRY
+        specs = _gateway_command_specs("hermes")
+        triggers = {s["trigger"] for s in specs}
+        cli_only = {c.name for c in COMMAND_REGISTRY if c.cli_only and not c.gateway_config_gate}
+        assert triggers  # non-empty
+        assert all(t.startswith("hermes:") for t in triggers)
+        # no cli_only command leaked into the registry
+        leaked = {t.split(":", 1)[1] for t in triggers} & cli_only
+        assert not leaked
+
+    def test_push_command_registry_sends_ok(self):
+        """push_command_registry POSTs to the plugin and returns its response."""
+        from plugins.platforms.mattermost import bridge_registry
+        import aiohttp
+        import asyncio
+
+        captured = {}
+
+        class FakeResp:
+            def __init__(self, status=200, body=None):
+                self.status = status
+                self._body = body or {"ok": True, "registered": 3}
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def json(self, **kw):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.closed = False
+            async def post(self, url, **kw):
+                captured["url"] = url
+                captured["headers"] = kw.get("headers")
+                captured["payload"] = kw.get("json")
+                return FakeResp()
+
+        async def go():
+            sess = FakeSession()
+            res = await bridge_registry.push_command_registry(
+                base_url="https://mm.example.com", shared_secret="sekret",
+                prefix="hermes", session=sess)
+            return res
+
+        res = asyncio.run(go())
+        assert res["ok"] is True
+        assert captured["url"].endswith("/plugins/hermes-bridge/config")
+        assert captured["headers"]["Authorization"] == "Bearer sekret"
+        cmds = captured["payload"]["commands"]
+        assert all(c["trigger"].startswith("hermes:") for c in cmds)
+        assert captured["payload"]["replace"] is True
+
+    def test_push_command_registry_survives_http_error(self):
+        """A non-2xx plugin response must NOT raise (fail-open, startup-safe)."""
+        from plugins.platforms.mattermost import bridge_registry
+        import asyncio
+
+        class FakeResp:
+            status = 401
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def json(self, **kw):
+                return {"id": "app.error", "message": "nope"}
+
+        class FakeSession:
+            closed = False
+            async def post(self, url, **kw):
+                return FakeResp()
+
+        res = asyncio.run(bridge_registry.push_command_registry(
+            base_url="https://mm.example.com", shared_secret="x", prefix="hermes",
+            session=FakeSession()))
+        assert res["ok"] is False
