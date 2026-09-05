@@ -365,6 +365,76 @@ class MattermostAdapter(BasePlatformAdapter):
                 payload["root_id"] = await self._resolve_root_id(str(candidate))
         return await self._post_preserving_thread(chat_id, payload, metadata)
 
+    async def send_interactive(
+        self, chat_id: str, text: str, buttons: Optional[List[Dict[str, Any]]] = None,
+        menu: Optional[Dict[str, Any]] = None, *, reply_to: Optional[str] = None,
+        metadata: _Metadata = None) -> SendResult:
+        """Send a post with interactive message buttons and/or a select menu.
+
+        All MM transport detail is hidden: the bot never sees integration URLs or
+        callback payloads. ``buttons`` = [{id, label, style}]; ``menu`` =
+        {id, name, placeholder, options: [{label, value}]}. Clicks arrive back as
+        ``hermes_bridge_interact`` WS events (relayed by the native plugin).
+        """
+        if not buttons and not menu:
+            return SendResult(success=False, error="send_interactive requires buttons or menu")
+        actions: List[Dict[str, Any]] = []
+        for b in buttons or []:
+            bid = str(b.get("id") or "").strip()
+            if not bid:
+                continue
+            actions.append({
+                "id": bid, "type": "button", "name": str(b.get("label") or bid),
+                "style": str(b.get("style") or "default"),
+                "integration": {"url": "/plugins/hermes-bridge/interact",
+                                "context": {"action_id": bid}},
+            })
+        if menu:
+            mid = str(menu.get("id") or "").strip()
+            if mid:
+                actions.append({
+                    "id": mid, "type": "select", "name": str(menu.get("placeholder") or menu.get("name") or mid),
+                    "data_source": str(menu.get("data_source") or ""),
+                    "options": [
+                        {"text": str(o.get("label") or o.get("value")), "value": str(o.get("value") or "")}
+                        for o in (menu.get("options") or [])],
+                    "integration": {"url": "/plugins/hermes-bridge/interact",
+                                    "context": {"action_id": mid}},
+                })
+        if not actions:
+            return SendResult(success=False, error="send_interactive: no valid actions")
+        base: Dict[str, Any] = {"channel_id": chat_id, "message": text}
+        payload = _with_mentions_disabled(base)
+        payload["props"] = {**(payload.get("props") or {}),
+                            "attachments": [{"text": text, "actions": actions}]}
+        if reply_to:
+            payload["root_id"] = await self._resolve_root_id(reply_to)
+        result = await self._api_post("posts", payload)
+        return _post_result(result, "Failed to create interactive post")
+
+    async def send_ephemeral(self, chat_id: str, user_id: str, text: str, *,
+                             metadata: _Metadata = None) -> SendResult:
+        """Send a message visible only to ``user_id`` in ``chat_id`` (POST /posts/ephemeral)."""
+        import aiohttp
+        payload = {
+            "user_id": user_id,
+            "post": {"channel_id": chat_id, "message": self.format_message(text), "props": _MATTERMOST_DISABLE_MENTIONS_PROPS},
+        }
+        if self._reply_mode == "thread" and isinstance(metadata, dict) and metadata.get("thread_id"):
+            payload["post"]["root_id"] = str(metadata["thread_id"])
+        url = f"{self._base_url}/api/v4/posts/ephemeral"
+        try:
+            async with self._session.post(url, json=payload, headers=self._headers(),
+                                          timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM ephemeral → %s: %s", resp.status, body[:200])
+                    return SendResult(success=False, error=f"ephemeral post failed ({resp.status})")
+                return SendResult(success=True)
+        except aiohttp.ClientError as exc:
+            logger.error("MM ephemeral network error: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
     async def _post_with_file(self, chat_id: str, file_id: str, caption: Optional[str], reply_to: Optional[str],
                               metadata: _Metadata) -> SendResult:
         return _post_result(await self._post_message(chat_id, caption or "", reply_to, metadata, [file_id]),
@@ -868,32 +938,43 @@ class MattermostAdapter(BasePlatformAdapter):
     async def _handle_bridge_interact(self, data: Dict[str, Any]) -> None:
         """Handle a `hermes_bridge_interact` WS event from the native plugin.
 
-        The plugin relays an interactive callback (button/menu/dialog) as a
-        custom WS event. Reconstruct the post context and surface the action to
-        the agent as a COMMAND-style signal the running handler can resolve.
+        The plugin relays an interactive callback (button/menu) as a structured
+        WS event (action_id, selected_option, context). Build a MessageEvent so
+        the agent sees the user's choice. Button clicks surface as a command
+        (`/action_id`); menu selections carry the picked value as the text and
+        the full context (session markers, etc.) in ``raw_message`` for the
+        handler to resolve without knowing MM transport details.
         """
         from gateway.platforms.base import MessageEvent, MessageType
-        raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-        raw = raw or {}
-        post_id = str(raw.get("post_id") or data.get("post_id") or "").strip()
-        action_id = str(raw.get("action_id") or data.get("action_id") or "").strip()
-        channel_id = str(raw.get("channel_id") or data.get("channel_id") or "").strip()
-        user_id = str(raw.get("user_id") or data.get("user_id") or "").strip()
-        user_name = str(raw.get("user_name") or "").lstrip("@") or user_id
-        thread_id = str(data.get("thread_id") or "").strip() or None
-        channel_code = str(data.get("channel_type") or "") or (await self._channel_type_code(channel_id) if channel_id else "")
+        post_id = str(data.get("post_id") or "").strip()
+        action_id = str(data.get("action_id") or "").strip()
+        selected = str(data.get("selected_option") or "").strip()
+        context = data.get("context") if isinstance(data.get("context"), dict) else {}
+        channel_id = str(data.get("channel_id") or "").strip()
+        user_id = str(data.get("user_id") or "").strip()
+        user_name = str(data.get("user_name") or "").lstrip("@") or user_id
         if not action_id or not channel_id:
             logger.warning("Mattermost: hermes_bridge_interact missing action/channel: %s", data)
             return
+        channel_code = await self._channel_type_code(channel_id)
         source = self.build_source(
             chat_id=channel_id,
             chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
             user_id=user_id, user_name=user_name,
-            thread_id=thread_id, message_id=post_id)
-        text = f"/{action_id}"
-        logger.info("Mattermost: bridge interact %s from %s in %s", action_id, user_name, channel_id)
+            thread_id=None, message_id=post_id)
+        # Button click -> `/action_id`; menu select -> the picked value (verbose
+        # so the agent answers the choice the user actually made).
+        if selected:
+            text = selected
+            msg_type = MessageType.TEXT
+        else:
+            text = f"/{action_id}"
+            msg_type = MessageType.COMMAND
+        logger.info("Mattermost: bridge interact action=%s selected=%r from %s in %s",
+                    action_id, selected, user_name, channel_id)
         await self.handle_message(MessageEvent(
-            text=text, message_type=MessageType.COMMAND, source=source, message_id=post_id))
+            text=text, message_type=msg_type, source=source, message_id=post_id,
+            raw_message={**context, "action_id": action_id, "selected_option": selected}))
 
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")

@@ -986,8 +986,8 @@ class TestMattermostBridgeEvents:
     async def test_bridge_interact_builds_command_event(self):
         a = self._bridge_adapter()
         evt = {"event": "hermes_bridge_interact", "data": {
-            "raw": {"post_id": "post_1", "action_id": "approve",
-                    "channel_id": "chan_9", "user_id": "bob"},
+            "action_id": "approve", "post_id": "post_1", "channel_id": "chan_9",
+            "user_id": "bob", "context": {"action_id": "approve"},
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
@@ -995,6 +995,23 @@ class TestMattermostBridgeEvents:
         assert msg.message_type == MessageType.COMMAND
         assert msg.text == "/approve"
         assert msg.source.user_id == "bob"
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_menu_selection_is_text(self):
+        """A menu selection carries the picked value as the agent-facing text."""
+        a = self._bridge_adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "pick", "selected_option": "chocolate",
+            "post_id": "post_1", "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "pick", "selected_option": "chocolate"},
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.message_type == MessageType.TEXT
+        assert msg.text == "chocolate"
+        assert msg.raw_message.get("action_id") == "pick"
+        assert msg.raw_message.get("selected_option") == "chocolate"
 
     @pytest.mark.asyncio
     async def test_bridge_command_namespaced_prefix_still_hits(self):
@@ -1153,3 +1170,60 @@ class TestMattermostBridgeRegistrySync:
             base_url="https://mm.example.com", shared_secret="x", prefix="hermes",
             session=FakeSession()))
         assert res["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Interactive messages (buttons/menus) + ephemeral replies
+# ---------------------------------------------------------------------------
+
+class TestMattermostInteractiveSend:
+
+    def _adapter(self):
+        a = _make_adapter()
+        a._session = MagicMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_builds_actions_payload(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "post_int_1"})
+        res = await a.send_interactive(
+            "chan_9", "Pick one", buttons=[{"id": "yes", "label": "Yes", "style": "primary"}],
+            menu={"id": "pick", "placeholder": "Choose", "options": [{"label": "A", "value": "a"}]})
+        assert res.success is True
+        path, payload = a._api_post.call_args.args
+        assert path == "posts"
+        attach = payload["props"]["attachments"][0]
+        actions = attach["actions"]
+        assert len(actions) == 2
+        btn = actions[0]
+        assert btn["type"] == "button" and btn["id"] == "yes"
+        assert btn["integration"]["url"] == "/plugins/hermes-bridge/interact"
+        assert btn["integration"]["context"]["action_id"] == "yes"
+        menu_action = actions[1]
+        assert menu_action["type"] == "select"
+        assert menu_action["options"] == [{"text": "A", "value": "a"}]
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_requires_action(self):
+        a = self._adapter()
+        res = await a.send_interactive("chan_9", "hi")
+        assert res.success is False
+
+    @pytest.mark.asyncio
+    async def test_send_ephemeral_posts_to_ephemeral_endpoint(self):
+        a = self._adapter()
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="")
+        a._session.post = MagicMock(return_value=mock_resp)
+        a._session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+        a._session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+        res = await a.send_ephemeral("chan_9", "bob", "psst")
+        assert res.success is True
+        url, kwargs = a._session.post.call_args.args[0], a._session.post.call_args.kwargs
+        assert url.endswith("/api/v4/posts/ephemeral")
+        body = kwargs["json"]
+        assert body["user_id"] == "bob"
+        assert body["post"]["channel_id"] == "chan_9"
+        assert body["post"]["message"] == "psst"

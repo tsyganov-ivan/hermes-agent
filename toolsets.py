@@ -150,6 +150,8 @@ TOOLSETS = {
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),
     "message_reactions": _ts("Attach/retract emoji reactions via the live gateway adapter", ["react_message"]),
+    "message_interactive": _ts("Mattermost interactive buttons/menus + ephemeral replies via the live gateway adapter",
+                               ["send_interactive_message", "update_message", "ephemeral_reply"]),
     "yuanbao": _ts("Yuanbao platform tools - group info, member queries, DM, stickers", _YUANBAO_TOOLS),
     "feishu_doc": _ts("Read Feishu/Lark document content", ["feishu_doc_read"]),
     "feishu_drive": _ts("Feishu/Lark document comment operations (list, reply, add)", _FEISHU_TOOLS[1:]),

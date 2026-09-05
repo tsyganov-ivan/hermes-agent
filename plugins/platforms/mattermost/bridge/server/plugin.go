@@ -115,12 +115,18 @@ func (p *Bridge) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 			return
 		}
 		p.handleConfig(w, r)
-	default:
+	case "/interact":
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "POST only")
 			return
 		}
 		p.handleInteract(w, r)
+	default:
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, "POST only")
+			return
+		}
+		writeErr(w, http.StatusNotFound, "unknown plugin endpoint: "+r.URL.Path)
 	}
 }
 
@@ -165,24 +171,46 @@ func (p *Bridge) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
+	// Mattermost delivers every button/menu click as a PostActionIntegrationRequest
+	// (the same JSON an external integration would get). Decode it and relay a
+	// structured WS event to the channel so the Hermes adapter can build a
+	// MessageEvent without knowing the MM wire format.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
-	var raw map[string]any
-	_ = json.Unmarshal(body, &raw)
-	// The channel is carried in the interactive-callback payload (post/action
-	// context). Query param is a fallback.
-	channelID, _ := raw["channel_id"].(string)
-	if channelID == "" {
-		channelID = r.URL.Query().Get("channel_id")
+	var req model.PostActionIntegrationRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
 	}
-	broadcast := &model.WebsocketBroadcast{}
-	if channelID != "" {
-		broadcast.ChannelId = channelID
+	// The action identity lives in the integration context we attached when the
+	// post was created (the bot puts {action_id, ...} there). Menus add
+	// selected_option. Fall back to a type marker when context is empty.
+	actionID, _ := req.Context["action_id"].(string)
+	if actionID == "" {
+		actionID = req.Type
 	}
-	p.API.PublishWebSocketEvent(wsExitInteract, map[string]any{"raw": raw}, broadcast)
+	selected, _ := req.Context["selected_option"].(string)
+
+	payload := map[string]any{
+		"action_id":       actionID,
+		"selected_option": selected,
+		"context":         req.Context,
+		"user_id":         req.UserId,
+		"user_name":       req.UserName,
+		"channel_id":      req.ChannelId,
+		"channel_name":    req.ChannelName,
+		"team_id":         req.TeamId,
+		"post_id":         req.PostId,
+		"trigger_id":      req.TriggerId,
+		"type":            req.Type,
+		"data_source":     req.DataSource,
+	}
+	log.Printf("hermes-bridge interact action=%s user=%s channel=%s", actionID, req.UserId, req.ChannelId)
+	p.API.PublishWebSocketEvent(wsExitInteract, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
+	// MM requires a 200 JSON response or it shows "Action failed to execute".
 	jsonOk(w, map[string]any{"ok": true})
 }
 
