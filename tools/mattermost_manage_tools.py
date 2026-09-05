@@ -89,6 +89,34 @@ def unpin_message(args: dict, **kw) -> str:
     return _manage_void_method(args, "unpin_message")
 
 
+def search_mattermost_posts(args: dict, **kw) -> str:
+    """Search the bot's own Mattermost history (scoped to the team of the target chat)."""
+    target = (args.get("target") or "").strip()
+    query = (args.get("query") or "").strip()
+    if not target:
+        return tool_error("'target' is required (e.g. 'mattermost:chat_id').")
+    if not query:
+        return tool_error("'query' is required.")
+    platform, chat_id, err = _resolve(target)
+    if chat_id is None:
+        return tool_error(err)
+    fn = getattr(_live_adapter(platform)[1], "search_posts", None)
+    if not callable(fn):
+        return tool_error("Mattermost adapter does not support search_posts")
+    page = int(args.get("page") or 0)
+    per_page = int(args.get("per_page") or 20)
+    try:
+        result = _run_on_loop(
+            platform,
+            lambda: fn(query=query, chat_id=chat_id, page=page, per_page=per_page))
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"success": False, "error": f"search_mattermost_posts failed: {e}"})
+    if isinstance(result, dict):
+        result.pop("raw_response", None)
+        return json.dumps(result)
+    return json.dumps({"success": bool(result)})
+
+
 # --- registrations -----------------------------------------------------------
 # toolset "message_manage" is added to _DIRECT_SURFACE_TOOLSETS in tools/tool_search.py,
 # so these are always visible (not deferred behind tool_search), like the other
@@ -167,5 +195,31 @@ registry.register(
         },
     },
     handler=lambda args, **kw: unpin_message(args, **kw),
+    check_fn=lambda: True,
+)
+
+registry.register(
+    name="search_mattermost_posts",
+    toolset="message_manage",
+    schema={
+        "name": "search_mattermost_posts",
+        "description": (
+            "Search Mattermost posts across the team the target conversation belongs to "
+            "(the bot's own chat history). Requires target 'mattermost:chat_id' (used to "
+            "resolve the team scope) and a query. Returns matching posts; use for 'what "
+            "did we say about X' without resorting to session_search on a local DB."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "mattermost:chat_id of the conversation."},
+                "query": {"type": "string", "description": "REQUIRED. Search terms."},
+                "page": {"type": "integer", "description": "0-based page (default 0)."},
+                "per_page": {"type": "integer", "description": "Results per page, max 200 (default 20)."},
+            },
+            "required": ["target", "query"],
+        },
+    },
+    handler=lambda args, **kw: search_mattermost_posts(args, **kw),
     check_fn=lambda: True,
 )

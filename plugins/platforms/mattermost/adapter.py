@@ -230,6 +230,8 @@ class MattermostAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Choice pickers (/reasoning, /fast): flat menu state keyed by channel_id.
         self._choice_picker_state: Dict[str, dict] = {}
+        # Cached fallback team for post search (GET /teams); resolved lazily.
+        self._default_team_cache: Optional[str] = None
 
     # --- HTTP helpers ---
 
@@ -384,6 +386,62 @@ class MattermostAdapter(BasePlatformAdapter):
         if self._last_post_status is not None and self._last_post_status >= 400:
             return {"success": False, "error": self._last_post_error or f"HTTP {self._last_post_status}"}
         return {"success": True}
+
+    async def _team_id_for_channel(self, channel_id: Optional[str]) -> Optional[str]:
+        """Resolve a channel's ``team_id`` (GET /channels/{id}). DM channels carry no
+        team — return None so callers fall back to the instance default."""
+        if not channel_id:
+            return None
+        data = await self._api_get(f"channels/{channel_id}")
+        tid = (data or {}).get("team_id") or ""
+        return tid or None
+
+    async def _default_team_id(self) -> Optional[str]:
+        """Best-effort cached fallback team id (GET /teams → first non-archived). Empty when
+        the bot is not a member of any team (then search can't resolve an instance-wide scope)."""
+        if self._default_team_cache is not None:
+            return self._default_team_cache
+        tid = ""
+        data = await self._api_get("teams")
+        if isinstance(data, list):
+            for team in data:
+                if (team or {}).get("delete_at", 0) == 0:
+                    tid = team.get("id") or ""
+                    break
+        self._default_team_cache = tid or None
+        return self._default_team_cache
+
+    async def search_posts(self, query: str, *, chat_id: Optional[str] = None,
+                           team_id: Optional[str] = None, page: int = 0,
+                           per_page: int = 20) -> Dict[str, Any]:
+        """Search posts via POST /api/v4/teams/{team_id}/posts/search. Returns {success, ...}
+        plus the server's ``posts``/``order`` payload on success.
+
+        MM has no team-agnostic post search — a ``team_id`` is always required. Resolution
+        order: explicit ``team_id`` → the target chat's channel ``team_id`` (works for channel
+        and group, but NOT a DM — DMs have no team) → the first available team on the instance.
+        """
+        if not query:
+            return {"success": False, "error": "search_posts requires a query"}
+        team = (team_id or await self._team_id_for_channel(chat_id)
+                or (await self._default_team_id() if not chat_id else None)
+                or await self._default_team_id())
+        if not team:
+            return {"success": False,
+                    "error": "search_posts could not resolve a team_id (chat is a DM and "
+                             "the bot is not a member of any team)"}
+        payload = {
+            "terms": query,
+            "is_or_search": False,
+            "page": max(0, int(page or 0)),
+            "per_page": min(200, max(1, int(per_page or 20))),
+            "include_comments": True,
+        }
+        data = await self._api_post(f"teams/{team}/posts/search", payload)
+        if not data or "posts" not in data:
+            return {"success": False,
+                    "error": self._last_post_error or "search returned no posts"}
+        return {**data, "success": True}
 
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
