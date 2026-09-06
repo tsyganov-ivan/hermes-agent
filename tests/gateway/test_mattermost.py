@@ -1328,6 +1328,36 @@ def test_send_interactive_tool_inherits_session_thread():
     assert captured["chat_id"] == "chan_9"
 
 
+def test_send_interactive_tool_splits_target_channel_from_thread():
+    """A target 'mattermost:channel:post' must split channel from the optional
+    ':post' suffix — the generic resolver hands 'channel:post' back as ONE
+    chat_id (no mattermost parser), so without the split the whole string is
+    sent as channel_id and Mattermost rejects it with 403."""
+    from tools import mattermost_interactive_tools as mit
+    captured = {}
+
+    class FakeAdapter:
+        async def send_interactive(self, **kw):
+            captured.update(kw)
+            return type("R", (), {"success": True, "message_id": "post_x", "error": None})()
+
+    fake_runner = object()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(mit, "_live_adapter", lambda p: (fake_runner, FakeAdapter()))
+    monkeypatch.setattr(
+        mit, "_dispatch_on_gateway_loop",
+        lambda runner, make_coro, *a, **k: make_coro())
+    try:
+        out = mit.send_interactive_message(
+            {"target": "mattermost:chan_9:post_789", "text": "Pick", "buttons": [{"id": "a", "label": "A"}]})
+    finally:
+        monkeypatch.undo()
+    res = json.loads(out)
+    assert res.get("success") is True
+    assert captured["chat_id"] == "chan_9"
+    assert captured["reply_to"] == "post_789"
+
+
 def test_send_interactive_tool_inherits_dm_message_when_no_thread():
     """In a DM there is no thread root — the bot replies to the message being
     answered (message_id) instead of creating a brand-new root post."""

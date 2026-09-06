@@ -32,6 +32,15 @@ def _target(chat_id: str, thread_id: Optional[str] = None, reply_to: Optional[st
         return None, None, err
     if platform_name != "mattermost":
         return None, None, "Interactive messages are only supported on mattermost, got " + platform_name
+    # Mattermost target syntax allows "mattermost:channel_id[:thread_post_id]". The generic
+    # resolver has no mattermost target parser, so with pass_unresolved_references=True it hands
+    # the raw "channel:thread" string back as the single chat_id (thread_id=None). If we pass that
+    # whole string to the adapter as channel_id, Mattermost rejects the post with 403
+    # (api.context.permissions.app_error — 'channel not found'). Split the optional ":thread"
+    # suffix here; Mattermost channel/post ids are 26-char alphanumeric so ":" never occurs inside
+    # an id and rpartition on the LAST ":" is unambiguous.
+    if tid is None and cid and ":" in cid:
+        cid, _sep, tid = cid.rpartition(":")
     return platform, cid, tid
 
 
