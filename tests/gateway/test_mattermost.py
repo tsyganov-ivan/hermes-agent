@@ -988,14 +988,16 @@ class TestMattermostBridgeEvents:
         evt = {"event": "hermes_bridge_interact", "data": {
             "action_id": "approve", "label": "Approve", "post_id": "post_1",
             "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "approve", "label": "Approve"},
+            "context": {"action_id": "approve", "label": "Approve",
+                        "question": "Одобрить запрос?"},
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
         msg = a.handle_message.await_args.args[0]
         assert msg.message_type == MessageType.TEXT
         # Button click surfaces the label as text — never an invented slash command.
-        assert msg.text == "Approve"
+        # It carries the question so the model sees WHAT the choice answers.
+        assert msg.text == 'Ответ на вопрос «Одобрить запрос?»: Approve'
         assert msg.source.user_id == "bob"
 
     @pytest.mark.asyncio
@@ -1005,16 +1007,30 @@ class TestMattermostBridgeEvents:
         evt = {"event": "hermes_bridge_interact", "data": {
             "action_id": "pick", "selected_option": "chocolate",
             "post_id": "post_1", "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "pick", "selected_option": "chocolate", "question_id": "q_1234"},
+            "context": {"action_id": "pick", "selected_option": "chocolate",
+                        "question_id": "q_1234", "question": "Любимый вкус?"},
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
         msg = a.handle_message.await_args.args[0]
         assert msg.message_type == MessageType.TEXT
-        assert msg.text == "chocolate"
+        assert msg.text == 'Ответ на вопрос «Любимый вкус?»: chocolate'
         assert msg.raw_message.get("action_id") == "pick"
         assert msg.raw_message.get("selected_option") == "chocolate"
         assert msg.raw_message.get("response_for_question_id") == "q_1234"
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_without_question_keeps_bare_choice(self):
+        """When the control carried no question text, fall back to the bare choice."""
+        a = self._bridge_adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "go", "label": "Отмена", "post_id": "post_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "go", "label": "Отмена"},
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert msg.text == "Отмена"
 
     @pytest.mark.asyncio
     async def test_bridge_command_namespaced_prefix_still_hits(self):
@@ -1210,6 +1226,7 @@ class TestMattermostInteractiveSend:
         assert btn["integration"]["url"] == "/plugins/hermes-bridge/interact"
         assert btn["integration"]["context"]["action_id"] == "yes"
         assert btn["integration"]["context"]["label"] == "Yes"
+        assert btn["integration"]["context"]["question"] == "Pick one"
         assert "question_id" not in btn["integration"]["context"]
         assert btn["integration"]["context"].get("submit") is None
         assert actions[1]["id"] == "no"

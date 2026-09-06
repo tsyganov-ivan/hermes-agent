@@ -514,6 +514,10 @@ class MattermostAdapter(BasePlatformAdapter):
             ctx: Dict[str, Any] = {"action_id": bid, "label": blabel}
             if question_id:
                 ctx["question_id"] = question_id
+            if text:
+                # Embed the question itself so the click (which only echoes the
+                # control's context back) can tell the model WHAT this answers.
+                ctx["question"] = text
             actions.append({
                 "id": bid, "type": "button", "name": blabel,
                 "style": str(b.get("style") or "default"),
@@ -525,6 +529,8 @@ class MattermostAdapter(BasePlatformAdapter):
                 mctx = {"action_id": mid}
                 if question_id:
                     mctx["question_id"] = question_id
+                if text:
+                    mctx["question"] = text
                 actions.append({
                     "id": mid, "type": "select", "name": str(menu.get("placeholder") or menu.get("name") or mid),
                     "data_source": str(menu.get("data_source") or ""),
@@ -569,6 +575,9 @@ class MattermostAdapter(BasePlatformAdapter):
         ctx: Dict[str, Any] = {"action_id": bid}
         if question_id:
             ctx["question_id"] = question_id
+        if text:
+            # Embed the question so the submit tell the model WHAT it answers.
+            ctx["question"] = text
         if question_id and not dialog.get("state"):
             dlg = dict(dialog)
             dlg["state"] = question_id
@@ -1405,9 +1414,17 @@ class MattermostAdapter(BasePlatformAdapter):
         # agent sees the picked label/value, not an invented slash command.
         label = str(context.get("label") or "").strip() if isinstance(context, dict) else ""
         question_id = str(context.get("question_id") or "").strip() if isinstance(context, dict) else ""
-        text = selected or label or action_id
-        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r from %s in %s",
-                    action_id, selected, label, user_name, channel_id)
+        # The control's context carries the question text the bot asked (embedded at
+        # send_interactive time). Surface it so the model sees WHAT this selection
+        # answers, not a bare token like "🍎 iOS". Falls back to just the choice.
+        question = str(context.get("question") or "").strip() if isinstance(context, dict) else ""
+        choice = selected or label or action_id
+        if question:
+            text = f'Ответ на вопрос «{question}»: {choice}'
+        else:
+            text = choice
+        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r question=%r from %s in %s",
+                    action_id, selected, label, question[:80], user_name, channel_id)
         await self.handle_message(MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, message_id=post_id,
             raw_message={**context,
