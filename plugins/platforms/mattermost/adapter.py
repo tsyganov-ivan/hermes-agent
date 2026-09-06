@@ -494,6 +494,17 @@ class MattermostAdapter(BasePlatformAdapter):
         """
         if not buttons and not menu:
             return SendResult(success=False, error="send_interactive requires buttons or menu")
+        # Forbidden: do not mix control types in one post. The simple interactive
+        # model allows EITHER several buttons OR one select menu (never both).
+        # Mixing them made the plugin's stateful redraw wipe the actions'
+        # integration (MM hides integration from GET, so a round-trip UpdatePost
+        # strips it) — buttons/Submit died after the first click. One post, one
+        # control kind.
+        if buttons and menu:
+            return SendResult(
+                success=False,
+                error="send_interactive: mixing buttons and menu is not allowed — "
+                      "send either several buttons OR one select menu, not both")
         actions: List[Dict[str, Any]] = []
         for b in buttons or []:
             bid = str(b.get("id") or "").strip()
@@ -503,10 +514,6 @@ class MattermostAdapter(BasePlatformAdapter):
             ctx: Dict[str, Any] = {"action_id": bid, "label": blabel}
             if question_id:
                 ctx["question_id"] = question_id
-            # A button with submit:true is the form's Submit control — the plugin
-            # accumulates other controls and on this click relays the WHOLE form.
-            if b.get("submit"):
-                ctx["submit"] = True
             actions.append({
                 "id": bid, "type": "button", "name": blabel,
                 "style": str(b.get("style") or "default"),
@@ -528,22 +535,6 @@ class MattermostAdapter(BasePlatformAdapter):
                 })
         if not actions:
             return SendResult(success=False, error="send_interactive: no valid actions")
-        # Multi-control forms need an explicit Submit button — the plugin only sends
-        # the whole form to the agent on a submit:true click. Auto-append one
-        # unless the model already provided it.
-        already = any(
-            (a.get("integration") or {}).get("context", {}).get("submit")
-            for a in actions
-        )
-        if len(actions) > 1 and not already:
-            sctx: Dict[str, Any] = {"action_id": "submit_form", "label": "Готово", "submit": True}
-            if question_id:
-                sctx["question_id"] = question_id
-            actions.append({
-                "id": "submit_form", "type": "button", "name": "Готово",
-                "style": "primary",
-                "integration": {"url": "/plugins/hermes-bridge/interact", "context": sctx},
-            })
         base: Dict[str, Any] = {"channel_id": chat_id, "message": ""}
         payload = _with_mentions_disabled(base)
         payload["props"] = {**(payload.get("props") or {}),
@@ -1414,37 +1405,15 @@ class MattermostAdapter(BasePlatformAdapter):
         # agent sees the picked label/value, not an invented slash command.
         label = str(context.get("label") or "").strip() if isinstance(context, dict) else ""
         question_id = str(context.get("question_id") or "").strip() if isinstance(context, dict) else ""
-        form_state = data.get("form_state")
-        if not isinstance(form_state, dict):
-            form_state = {}
-        submission = data.get("submission")
-        if not isinstance(submission, dict):
-            submission = {}
-        # A click on ONE control of a multi-control form is NOT final — the plugin
-        # redrew the post with progress itself, so the agent must not answer it as a
-        # separate message (the bug: bot reacted to every select of a form window).
-        # Only a single-action choice or a Submit click (final=true) wakes the agent.
-        is_final = data.get("final")
-        if is_final is False:
-            logger.info("Mattermost: bridge interact (form progress, not final) action=%s from %s",
-                        action_id, user_name)
-            return
         text = selected or label or action_id
-        # A submit action carries the accumulated form submission for a multi-control
-        # post; include it (and the in-progress state) so the agent sees the whole
-        # form, not just the last control's value.
-        if submission:
-            text = f"[Form submitted] " + ", ".join(f"{k}={v}" for k, v in submission.items())
-        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r submit=%d from %s in %s",
-                    action_id, selected, label, 1 if submission else 0, user_name, channel_id)
+        logger.info("Mattermost: bridge interact action=%s selected=%r label=%r from %s in %s",
+                    action_id, selected, label, user_name, channel_id)
         await self.handle_message(MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, message_id=post_id,
             raw_message={**context,
                          "action_id": action_id,
                          "selected_option": selected,
-                         "response_for_question_id": question_id or None,
-                         "form_state": form_state or None,
-                         "submission": submission or None}))
+                         "response_for_question_id": question_id or None}))
 
     async def _handle_bridge_dialog(self, data: Dict[str, Any]) -> None:
         """Handle a `hermes_bridge_dialog` WS event from the native plugin.

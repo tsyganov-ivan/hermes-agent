@@ -1187,12 +1187,13 @@ class TestMattermostInteractiveSend:
         return a
 
     @pytest.mark.asyncio
-    async def test_send_interactive_builds_actions_payload(self):
+    async def test_send_interactive_builds_buttons_payload(self):
         a = self._adapter()
         a._api_post = AsyncMock(return_value={"id": "post_int_1"})
         res = await a.send_interactive(
-            "chan_9", "Pick one", buttons=[{"id": "yes", "label": "Yes", "style": "primary"}],
-            menu={"id": "pick", "placeholder": "Choose", "options": [{"label": "A", "value": "a"}]})
+            "chan_9", "Pick one",
+            buttons=[{"id": "yes", "label": "Yes", "style": "primary"},
+                     {"id": "no", "label": "No"}])
         assert res.success is True
         path, payload = a._api_post.call_args.args
         assert path == "posts"
@@ -1202,23 +1203,43 @@ class TestMattermostInteractiveSend:
         attach = payload["props"]["attachments"][0]
         assert attach["text"] == "Pick one"
         actions = attach["actions"]
-        # Multi-control post (button + menu) → auto-append a Submit button.
-        assert len(actions) == 3
+        # Multiple buttons, one control kind — no Submit auto-appended.
+        assert len(actions) == 2
         btn = actions[0]
         assert btn["type"] == "button" and btn["id"] == "yes"
         assert btn["integration"]["url"] == "/plugins/hermes-bridge/interact"
         assert btn["integration"]["context"]["action_id"] == "yes"
         assert btn["integration"]["context"]["label"] == "Yes"
         assert "question_id" not in btn["integration"]["context"]
-        menu_action = actions[1]
+        assert btn["integration"]["context"].get("submit") is None
+        assert actions[1]["id"] == "no"
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_builds_menu_payload(self):
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "post_int_1"})
+        res = await a.send_interactive(
+            "chan_9", "Choose", menu={"id": "pick", "placeholder": "Choose",
+                                      "options": [{"label": "A", "value": "a"}]})
+        assert res.success is True
+        actions = a._api_post.call_args.args[1]["props"]["attachments"][0]["actions"]
+        assert len(actions) == 1
+        menu_action = actions[0]
         assert menu_action["type"] == "select"
         assert menu_action["options"] == [{"text": "A", "value": "a"}]
-        # Auto-added Submit button: submit:true in context so the plugin relays the
-        # whole form on its click.
-        submit = actions[2]
-        assert submit["type"] == "button" and submit["name"] == "Готово"
-        assert submit["integration"]["context"]["submit"] is True
-        assert submit["integration"]["context"]["action_id"] == "submit_form"
+        assert menu_action["integration"]["context"]["action_id"] == "pick"
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_forbids_mixing_buttons_and_menu(self):
+        """Mixing buttons + menu in one post is rejected — one post, one control kind."""
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "x"})
+        res = await a.send_interactive(
+            "chan_9", "Pick", buttons=[{"id": "yes", "label": "Yes"}],
+            menu={"id": "pick", "placeholder": "Choose", "options": [{"label": "A", "value": "a"}]})
+        assert res.success is False
+        assert "mixing" in (res.error or "").lower()
+        a._api_post.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_interactive_single_button_no_auto_submit(self):
@@ -1635,10 +1656,10 @@ class TestMattermostBridgeDialog:
 
 
 # ---------------------------------------------------------------------------
-# bridge interact: form_state + submit accumulation
+# bridge interact: every click is a final TEXT choice (no form accumulation)
 # ---------------------------------------------------------------------------
 
-class TestMattermostInteractFormState:
+class TestMattermostInteractSimple:
 
     def _adapter(self, **extra):
         from plugins.platforms.mattermost.adapter import MattermostAdapter
@@ -1653,78 +1674,38 @@ class TestMattermostInteractFormState:
         return a
 
     @pytest.mark.asyncio
-    async def test_interact_carries_form_state(self):
-        """A normal click carries the accumulated form_state for the post."""
+    async def test_interact_button_click_is_final_text(self):
+        """A button click is a final choice — the agent sees the label as text
+        (never an invented slash command), and no form_state/submit exists."""
         a = self._adapter()
         evt = {"event": "hermes_bridge_interact", "data": {
-            "action_id": "size", "selected_option": "s", "post_id": "form_1",
-            "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "size", "selected_option": "s"},
-            "form_state": {"size": "s"},
-        }}
-        await a._handle_ws_event(evt)
-        msg = a.handle_message.await_args.args[0]
-        assert msg.raw_message["form_state"] == {"size": "s"}
-        assert msg.raw_message.get("submission") is None
-        assert msg.text == "s"  # choice text, not a fake command
-
-    @pytest.mark.asyncio
-    async def test_interact_submit_full_submission(self):
-        """A submit click relays the whole accumulated form as submission text."""
-        a = self._adapter()
-        evt = {"event": "hermes_bridge_interact", "data": {
-            "action_id": "submit", "selected_option": "", "post_id": "form_1",
-            "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "submit", "label": "Готово", "submit": True},
-            "form_state": {"size": "s", "veggie": "yes"},
-            "submission": {"size": "s", "veggie": "yes"},
-        }}
-        await a._handle_ws_event(evt)
-        msg = a.handle_message.await_args.args[0]
-        assert msg.raw_message["submission"] == {"size": "s", "veggie": "yes"}
-        assert msg.raw_message["form_state"] == {"size": "s", "veggie": "yes"}
-        assert "size=s" in msg.text and "veggie=yes" in msg.text
-
-    @pytest.mark.asyncio
-    async def test_interact_not_final_does_not_wake_model(self):
-        """A click on one control of a multi-control form (final=false) must NOT
-        wake the agent — the plugin already redrew the post with progress."""
-        a = self._adapter()
-        evt = {"event": "hermes_bridge_interact", "data": {
-            "action_id": "size", "selected_option": "s", "post_id": "form_1",
-            "channel_id": "chan_9", "user_id": "bob",
-            "context": {"action_id": "size"},
-            "form_state": {"size": "s"},
-            "final": False,
-        }}
-        await a._handle_ws_event(evt)
-        a.handle_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_interact_final_wakes_model(self):
-        """A final click (single choice or submit) DOES wake the agent."""
-        a = self._adapter()
-        evt = {"event": "hermes_bridge_interact", "data": {
-            "action_id": "yes", "selected_option": "", "post_id": "single_1",
+            "action_id": "yes", "selected_option": "", "post_id": "post_1",
             "channel_id": "chan_9", "user_id": "bob",
             "context": {"action_id": "yes", "label": "Да"},
-            "form_state": {},
-            "final": True,
         }}
         await a._handle_ws_event(evt)
         a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.text == "Да"
+        assert msg.raw_message.get("action_id") == "yes"
+        assert "form_state" not in msg.raw_message
+        assert "submission" not in msg.raw_message
 
     @pytest.mark.asyncio
-    async def test_send_interactive_submit_button_sets_context_flag(self):
-        """A button marked submit:true must carry submit:true in integration.context."""
+    async def test_interact_menu_selection_is_final_text(self):
+        """A menu selection is a final choice carrying the picked value."""
         a = self._adapter()
-        a._session = MagicMock()
-        a._api_post = AsyncMock(return_value={"id": "p9"})
-        a._api = AsyncMock(return_value={})
-        result = await a.send_interactive(
-            "chan_9", "Выбери всё",
-            buttons=[{"id": "submit", "label": "Готово", "submit": True}],
-            menu={"id": "size", "placeholder": "Размер", "options": [{"label": "S", "value": "s"}]})
-        assert result.success
-        submit_action = a._api_post.call_args.args[1]["props"]["attachments"][0]["actions"][0]
-        assert submit_action["integration"]["context"].get("submit") is True
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "opt", "selected_option": "chocolate", "post_id": "post_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "opt", "selected_option": "chocolate",
+                        "question_id": "q_5"},
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+        msg = a.handle_message.await_args.args[0]
+        assert msg.text == "chocolate"
+        assert msg.raw_message.get("selected_option") == "chocolate"
+        assert msg.raw_message.get("response_for_question_id") == "q_5"
+        assert "form_state" not in msg.raw_message
+        assert "submission" not in msg.raw_message

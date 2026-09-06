@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
@@ -22,23 +21,6 @@ type Bridge struct {
 	client   *pluginapi.Client
 	cfg      *configuration
 	registry []CommandSpec // commands this plugin currently owns (last-wins)
-
-	// Interactive form state for multi-control posts (buttons + select menus).
-	// keyed by post_id → action_id → {value, question_id}. A post with a single
-	// action is a final choice and is NOT stored here (it is redraw-disabled
-	// instead). Guarded by mu. This makes the plugin stateful FOR FORMS ONLY — it
-	// never interprets what an agent will do, it just accumulates selections so a
-	// multi-control post can redraw (show progress) without wiping other fields,
-	// and on Submit can relay every answer WITH its question_id in one submission.
-	mu        sync.Mutex
-	formState map[string]map[string]formAnswer // post_id -> action_id -> answer
-}
-
-// formAnswer is one control's accumulated selection. It keeps the question_id the
-// posting bot attached (so a Submit relays each field WITH its question_id back).
-type formAnswer struct {
-	Value      string
-	QuestionID string
 }
 
 // configuration mirrors the server-side plugin settings.
@@ -240,26 +222,11 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 			selected = lbl
 		}
 	}
-	isSubmit := false
-	if sb, ok := req.Context["submit"].(bool); ok && sb {
-		isSubmit = true
-	}
-
-	// final = a click that should wake the agent: a single-action choice (one
-	// button = one answer) OR a Submit click (the whole multi-control form).
-	// A click on ONE control of a multi-control form is NOT final — the agent
-	// should NOT answer it; the plugin redraws the post with progress and waits
-	// for Submit. This stops the bot reacting to each select of a form separately
-	// (the exact UX Ivan flagged).
-	isFinal := isSubmit
-	if req.PostId != "" && !isFinal {
-		isFinal = p.postIsSingleAction(req.PostId)
-	}
-
-	// Always relay the accumulated form state for this post (all controls), so the
-	// agent sees progress across clicks. On a submit action the agent ALSO gets the
-	// full submission keyed by each control's question_id (all answers, one read).
-	formState := p.snapshotFormState(req.PostId)
+	// Every button/menu click in the simple interactive model is a FINAL choice:
+	// the post is either a set of buttons OR a single select (mixing is forbidden
+	// adapter-side), so each click IS an answer the agent should act on. There is
+	// no multi-control accumulation / Submit — the plugin is a dumb relay that
+	// publishes the choice and then disables-after-pick on the post.
 	payload := map[string]any{
 		"action_id":       actionID,
 		"selected_option": selected,
@@ -273,102 +240,21 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		"trigger_id":      req.TriggerId,
 		"type":            req.Type,
 		"data_source":     req.DataSource,
-		"form_state":      formState,
-		"final":           isFinal,
 	}
-	if isSubmit {
-		payload["submission"] = p.snapshotSubmission(req.PostId)
-	}
-	log.Printf("hermes-bridge interact action=%s submit=%t final=%t user=%s channel=%s",
-		actionID, isSubmit, isFinal, req.UserId, req.ChannelId)
+	log.Printf("hermes-bridge interact action=%s selected=%q user=%s channel=%s",
+		actionID, selected, req.UserId, req.ChannelId)
 	p.API.PublishWebSocketEvent(wsExitInteract, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
 
-	// Submit: the form is complete — disable every control (final answer delivered).
-	// Normal click: accumulate + redraw by state, keeping every other control live.
+	// Disable-after-pick: clear the actions so no second choice is possible.
 	if req.PostId != "" {
-		if isSubmit {
-			// Complete: show ALL accumulated values and disable every action.
-			if updated := p.interactRedrawFinal(req.PostId); updated != nil {
-				if err := p.client.Post.UpdatePost(updated); err != nil {
-					log.Printf("hermes-bridge interact: update post failed: %v", err)
-				}
-			}
-			return
-		}
-		single := p.postIsSingleAction(req.PostId)
-		if single {
-			// Final single choice → disable-after-pick (old behaviour).
-			if updated := p.interactRedrawPost(req.PostId, selected); updated != nil {
-				if err := p.client.Post.UpdatePost(updated); err != nil {
-					log.Printf("hermes-bridge interact: update post failed: %v", err)
-				}
-			}
-		} else {
-			// A multi-control form → accumulate + redraw by state (keep all controls).
-			qid, _ := req.Context["question_id"].(string)
-			if updated := p.interactRedrawStateful(req.PostId, actionID, selected, qid); updated != nil {
-				if err := p.client.Post.UpdatePost(updated); err != nil {
-					log.Printf("hermes-bridge interact: update post failed: %v", err)
-				}
+		if updated := p.interactRedrawPost(req.PostId, selected); updated != nil {
+			if err := p.client.Post.UpdatePost(updated); err != nil {
+				log.Printf("hermes-bridge interact: update post failed: %v", err)
 			}
 		}
 	}
 	// MM requires a 200 JSON response or it shows "Action failed to execute".
 	jsonOk(w, map[string]any{"ok": true})
-}
-
-func (p *Bridge) snapshotFormState(postID string) map[string]any {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	cp := make(map[string]any, len(p.formState[postID]))
-	for k, v := range p.formState[postID] {
-		cp[k] = v.Value // value by action_id (progress view)
-	}
-	return cp
-}
-
-// snapshotSubmission collects every accumulated answer for a post, keyed by the
-// question_id the posting bot attached to each control. Controls that carried no
-// question_id fall back to their action_id so the agent still gets a key. The WS
-// payload uses this on a Submit click so ALL answers arrive in one read WITH their
-// question_id (Ivan's requirement).
-func (p *Bridge) snapshotSubmission(postID string) map[string]any {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make(map[string]any, len(p.formState[postID]))
-	for aid, ans := range p.formState[postID] {
-		key := ans.QuestionID
-		if key == "" {
-			key = aid
-		}
-		out[key] = ans.Value
-	}
-	return out
-}
-
-// postIsSingleAction reports whether the post has exactly one total interactive
-// action across all attachments. Single => the click is a final choice (safe to
-// redraw-disable). Multiple => a multi-control form; the plugin must NOT redraw it.
-func (p *Bridge) postIsSingleAction(postID string) bool {
-	post, err := p.client.Post.GetPost(postID)
-	if err != nil || post == nil {
-		return false // can't tell → safer not to redraw
-	}
-	props := post.GetProps()
-	attachments, _ := props["attachments"].([]any)
-	total := 0
-	for _, a := range attachments {
-		am, ok := a.(map[string]any)
-		if !ok {
-			continue
-		}
-		acts, ok := am["actions"].([]any)
-		if !ok {
-			continue
-		}
-		total += len(acts)
-	}
-	return total == 1
 }
 
 // handleDialogOpen opens an interactive dialog on the clicking user's client. The
@@ -439,169 +325,6 @@ func (p *Bridge) handleDialogSubmit(w http.ResponseWriter, r *http.Request) {
 		"cancel", req.Cancelled, "channel_id", req.ChannelId)
 	p.API.PublishWebSocketEvent(wsExitDialog, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
 	jsonOk(w, map[string]any{"ok": true})
-}
-
-// interactRedrawFinal shows all accumulated form values and clears every action
-// — used when the form's Submit button is clicked (the form is complete).
-func (p *Bridge) interactRedrawFinal(postID string) *model.Post {
-	post, err := p.client.Post.GetPost(postID)
-	if err != nil || post == nil {
-		return nil
-	}
-	updated := post.Clone()
-	srcProps := post.GetProps()
-	props := make(map[string]any, len(srcProps))
-	for k, v := range srcProps {
-		props[k] = v
-	}
-	p.mu.Lock()
-	sel := make(map[string]formAnswer, len(p.formState[postID]))
-	for k, v := range p.formState[postID] {
-		sel[k] = v
-	}
-	p.mu.Unlock()
-
-	attachments, _ := props["attachments"].([]any)
-	built := make([]any, 0, len(attachments))
-	allSel := []string{}
-	for _, a := range attachments {
-		am, ok := a.(map[string]any)
-		if !ok {
-			built = append(built, a)
-			continue
-		}
-		cp := make(map[string]any, len(am))
-		for k, v := range am {
-			cp[k] = v
-		}
-		delete(cp, "actions") // form complete → no more controls
-		base := ""
-		if s, ok := cp["text"].(string); ok {
-			if i := strings.Index(s, "\n\n**Выбор:**"); i >= 0 {
-				base = strings.TrimSpace(s[:i])
-			} else {
-				base = strings.TrimSpace(s)
-			}
-		}
-		lines := []string{}
-		for aid, ans := range sel {
-			if ans.Value == "" {
-				continue
-			}
-			lines = append(lines, "**"+aid+":** "+ans.Value)
-			allSel = append(allSel, aid+"="+ans.Value)
-		}
-		txt := base
-		if len(lines) > 0 {
-			txt = base + "\n\n**Выбор:**\n" + strings.Join(lines, "\n")
-		}
-		cp["text"] = txt
-		built = append(built, cp)
-	}
-	if len(built) > 0 {
-		props["attachments"] = built
-	}
-	props["selected"] = strings.Join(allSel, "; ")
-	updated.SetProps(props)
-	return updated
-}
-
-func (p *Bridge) interactRedrawStateful(postID, actionID, selected, questionID string) *model.Post {
-	if postID == "" {
-		return nil
-	}
-	if selected != "" {
-		p.mu.Lock()
-		if p.formState == nil {
-			p.formState = make(map[string]map[string]formAnswer)
-		}
-		f := p.formState[postID]
-		if f == nil {
-			f = make(map[string]formAnswer)
-			p.formState[postID] = f
-		}
-		f[actionID] = formAnswer{Value: selected, QuestionID: questionID}
-		p.mu.Unlock()
-	}
-	post, err := p.client.Post.GetPost(postID)
-	if err != nil || post == nil {
-		return nil
-	}
-	updated := post.Clone()
-	srcProps := post.GetProps()
-	props := make(map[string]any, len(srcProps))
-	for k, v := range srcProps {
-		props[k] = v
-	}
-
-	// Snapshot the full selection state (all controls) for this post.
-	p.mu.Lock()
-	sel := make(map[string]formAnswer, len(p.formState[postID]))
-	for k, v := range p.formState[postID] {
-		sel[k] = v
-	}
-	p.mu.Unlock()
-
-	// Rebuild attachments: keep EVERY action so other controls stay live, but show
-	// each control's accumulated selection as a compact progress line. The selected
-	// values also ride props.selected so Hermes can read them without parsing the
-	// wire format.
-	attachments, _ := props["attachments"].([]any)
-	built := make([]any, 0, len(attachments))
-	allSel := []string{}
-	for _, a := range attachments {
-		am, ok := a.(map[string]any)
-		if !ok {
-			built = append(built, a)
-			continue
-		}
-		cp := make(map[string]any, len(am))
-		for k, v := range am {
-			cp[k] = v
-		}
-		base := ""
-		if s, ok := cp["text"].(string); ok {
-			// If this is not the first redraw, strip any previous progress block
-			// so we don't compound "Выбрано:" lines on every click.
-			if i := strings.Index(s, "\n\n**Выбор:**"); i >= 0 {
-				base = strings.TrimSpace(s[:i])
-			} else {
-				base = strings.TrimSpace(s)
-			}
-		}
-		lines := []string{}
-		if acts, ok := cp["actions"].([]any); ok {
-			for _, ac := range acts {
-				am2, ok := ac.(map[string]any)
-				if !ok {
-					continue
-				}
-				aid, _ := am2["id"].(string)
-				name, _ := am2["name"].(string)
-				if name == "" {
-					name = aid
-				}
-				// Mark the control's current value if one is in state.
-				if v, ok := sel[aid]; ok && v.Value != "" {
-					lines = append(lines, "**"+name+":** "+v.Value)
-					allSel = append(allSel, name+"="+v.Value)
-				}
-			}
-		}
-		txt := base
-		if len(lines) > 0 {
-			txt = base + "\n\n**Выбор:**\n" + strings.Join(lines, "\n")
-		}
-		cp["text"] = txt
-		// Copy actions back unchanged — nothing removed.
-		built = append(built, cp)
-	}
-	if len(built) > 0 {
-		props["attachments"] = built
-	}
-	props["selected"] = strings.Join(allSel, "; ")
-	updated.SetProps(props)
-	return updated
 }
 
 // interactRedrawPost returns an updated post with the interactive actions cleared

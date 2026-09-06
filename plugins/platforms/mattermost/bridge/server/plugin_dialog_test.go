@@ -237,68 +237,65 @@ func TestDialogCancelRelaysWS(t *testing.T) {
 	}
 }
 
-// The stateful path: a multi-control post (buttons + select) must NOT have its
-// other controls wiped when one is selected. First a select pick, then a button
-// click — the post keeps every action and accumulates progress.
-func TestMultiControlRedrawKeepsOtherControls(t *testing.T) {
+// A button/menu click in the simple interactive model is a FINAL choice: the
+// plugin relays it as a structured WS event (action_id + selected), then
+// disables-after-pick by clearing every action on the post (no second choice).
+func TestInteractClickIsFinalAndDisables(t *testing.T) {
 	b := newBridge()
 	api := b.API.(*bridgeTestAPI)
-	post := &model.Post{Id: "form_1", ChannelId: "chan_9",
+	api.posts["pick_1"] = &model.Post{Id: "pick_1", ChannelId: "chan_9",
 		Props: map[string]any{"attachments": []any{
 			map[string]any{
-				"text": "Configure",
+				"text": "Choose",
 				"actions": []any{
-					map[string]any{"id": "size", "type": "select", "name": "Size",
-						"options": []any{map[string]any{"text": "S", "value": "s"}}},
-					map[string]any{"id": "submit", "type": "button", "name": "Собрать"},
+					map[string]any{"id": "a", "type": "button", "name": "A"},
+					map[string]any{"id": "b", "type": "button", "name": "B"},
 				},
 			},
 		}}}
-	api.posts["form_1"] = post
 
-	// Select pick on the size menu.
 	rec := doServeHTTP(b, "/interact", map[string]any{
-		"user_id": "u1", "channel_id": "chan_9", "post_id": "form_1",
-		"type": "select", "context": map[string]any{"action_id": "size", "selected_option": "s"},
+		"user_id": "u1", "user_name": "op", "channel_id": "chan_9", "post_id": "pick_1",
+		"type": "button", "context": map[string]any{"action_id": "a", "label": "A"},
+		"trigger_id": "trig",
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("select: expected 200, got %d", rec.Code)
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	stored, _ := api.posts["form_1"]
+
+	// First: the choice was relayed as a hermes_bridge_interact WS event with the
+	// action_id + selected label (text choice, not an invented command).
+	if len(api.wsEvents) != 1 {
+		t.Fatalf("expected 1 WS event, got %d", len(api.wsEvents))
+	}
+	evt := api.wsEvents[0]
+	if evt.event != wsExitInteract {
+		t.Errorf("expected event %q, got %q", wsExitInteract, evt.event)
+	}
+	if evt.payload["action_id"] != "a" {
+		t.Errorf("expected action_id a, got %v", evt.payload["action_id"])
+	}
+	if evt.payload["selected_option"] != "A" {
+		t.Errorf("expected selected_option A, got %v", evt.payload["selected_option"])
+	}
+	if evt.payload["post_id"] != "pick_1" {
+		t.Errorf("expected post_id pick_1, got %v", evt.payload["post_id"])
+	}
+	if _, hasFinal := evt.payload["final"]; hasFinal {
+		t.Error("payload must not carry a final flag (every click is final)")
+	}
+
+	// Second: disable-after-pick — all actions cleared, choice recorded.
+	stored, _ := api.posts["pick_1"]
 	props := stored.GetProps()
 	atts := props["attachments"].([]any)
 	am := atts[0].(map[string]any)
-	acts := am["actions"].([]any)
-	// Both controls must still be present.
-	if len(acts) != 2 {
-		t.Fatalf("select: expected 2 actions kept, got %d", len(acts))
+	if acts, ok := am["actions"].([]any); ok && len(acts) != 0 {
+		t.Fatalf("expected actions cleared after pick, got %v", am["actions"])
 	}
 	txt := am["text"].(string)
-	if !containsStr(txt, "Size") || !containsStr(txt, "s") {
-		t.Errorf("select: progress line missing Size in text: %q", txt)
-	}
-	if !containsStr(props["selected"].(string), "Size=s") {
-		t.Errorf("select: props.selected missing Size=s: %q", props["selected"])
-	}
-
-	// Now a button click on submit — state is fully accumulated, controls stay.
-	rec2 := doServeHTTP(b, "/interact", map[string]any{
-		"user_id": "u1", "channel_id": "chan_9", "post_id": "form_1",
-		"type": "button", "context": map[string]any{"action_id": "submit", "label": "Собрать"},
-	})
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("button: expected 200, got %d", rec2.Code)
-	}
-	stored2, _ := api.posts["form_1"]
-	props2 := stored2.GetProps()
-	atts2 := props2["attachments"].([]any)
-	am2 := atts2[0].(map[string]any)
-	if len(am2["actions"].([]any)) != 2 {
-		t.Errorf("button: expected both actions kept, got %d", len(am2["actions"].([]any)))
-	}
-	sel := props2["selected"].(string)
-	if !containsStr(sel, "Size=s") {
-		t.Errorf("button: selected should still carry Size=s: %q", sel)
+	if !containsStr(txt, "A") {
+		t.Errorf("expected choice A recorded in text, got %q", txt)
 	}
 }
 
@@ -306,23 +303,42 @@ func containsStr(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
 }
 
-// postIsSingleAction must return false for a multi-control post so it takes the
-// stateful redraw path (not the wipe-everything disable).
-func TestPostIsSingleActionMulti(t *testing.T) {
+// A menu selection is the same final path with the select's chosen value.
+func TestInteractMenuSelectionIsFinal(t *testing.T) {
 	b := newBridge()
 	api := b.API.(*bridgeTestAPI)
-	api.posts["form_1"] = &model.Post{Id: "form_1", ChannelId: "chan_9",
+	api.posts["menu_1"] = &model.Post{Id: "menu_1", ChannelId: "chan_9",
 		Props: map[string]any{"attachments": []any{
-			map[string]any{"text": "x", "actions": []any{
-				map[string]any{"id": "a"},
-				map[string]any{"id": "b"}}}}}}
-	if b.postIsSingleAction("form_1") {
-		t.Error("multi-action post must not be treated as single-action")
+			map[string]any{
+				"text": "Pick one",
+				"actions": []any{
+					map[string]any{"id": "opt", "type": "select", "name": "Opt",
+						"options": []any{
+							map[string]any{"text": "S", "value": "s"},
+							map[string]any{"text": "L", "value": "l"}}},
+				},
+			},
+		}}}
+
+	rec := doServeHTTP(b, "/interact", map[string]any{
+		"user_id": "u1", "user_name": "op", "channel_id": "chan_9", "post_id": "menu_1",
+		"type": "select", "context": map[string]any{"action_id": "opt", "selected_option": "l"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	api.posts["single_1"] = &model.Post{Id: "single_1", Props: map[string]any{
-		"attachments": []any{map[string]any{"text": "x", "actions": []any{
-			map[string]any{"id": "go"}}}}}}
-	if !b.postIsSingleAction("single_1") {
-		t.Error("single-action post must be treated as single-action")
+	if len(api.wsEvents) != 1 {
+		t.Fatalf("expected 1 WS event, got %d", len(api.wsEvents))
+	}
+	if api.wsEvents[0].payload["selected_option"] != "l" {
+		t.Errorf("expected selected_option l, got %v", api.wsEvents[0].payload["selected_option"])
+	}
+	// Actions cleared after the menu pick too.
+	stored, _ := api.posts["menu_1"]
+	props := stored.GetProps()
+	atts := props["attachments"].([]any)
+	am := atts[0].(map[string]any)
+	if acts, ok := am["actions"].([]any); ok && len(acts) != 0 {
+		t.Fatalf("expected menu actions cleared after pick, got %v", am["actions"])
 	}
 }
