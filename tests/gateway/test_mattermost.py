@@ -1686,6 +1686,35 @@ class TestMattermostInteractFormState:
         assert "size=s" in msg.text and "veggie=yes" in msg.text
 
     @pytest.mark.asyncio
+    async def test_interact_not_final_does_not_wake_model(self):
+        """A click on one control of a multi-control form (final=false) must NOT
+        wake the agent — the plugin already redrew the post with progress."""
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "size", "selected_option": "s", "post_id": "form_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "size"},
+            "form_state": {"size": "s"},
+            "final": False,
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interact_final_wakes_model(self):
+        """A final click (single choice or submit) DOES wake the agent."""
+        a = self._adapter()
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "yes", "selected_option": "", "post_id": "single_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "yes", "label": "Да"},
+            "form_state": {},
+            "final": True,
+        }}
+        await a._handle_ws_event(evt)
+        a.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_interactive_submit_button_sets_context_flag(self):
         """A button marked submit:true must carry submit:true in integration.context."""
         a = self._adapter()

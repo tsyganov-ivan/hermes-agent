@@ -1420,6 +1420,15 @@ class MattermostAdapter(BasePlatformAdapter):
         submission = data.get("submission")
         if not isinstance(submission, dict):
             submission = {}
+        # A click on ONE control of a multi-control form is NOT final — the plugin
+        # redrew the post with progress itself, so the agent must not answer it as a
+        # separate message (the bug: bot reacted to every select of a form window).
+        # Only a single-action choice or a Submit click (final=true) wakes the agent.
+        is_final = data.get("final")
+        if is_final is False:
+            logger.info("Mattermost: bridge interact (form progress, not final) action=%s from %s",
+                        action_id, user_name)
+            return
         text = selected or label or action_id
         # A submit action carries the accumulated form submission for a multi-control
         # post; include it (and the in-progress state) so the agent sees the whole

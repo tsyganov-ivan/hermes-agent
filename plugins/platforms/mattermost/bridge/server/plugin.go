@@ -245,6 +245,17 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		isSubmit = true
 	}
 
+	// final = a click that should wake the agent: a single-action choice (one
+	// button = one answer) OR a Submit click (the whole multi-control form).
+	// A click on ONE control of a multi-control form is NOT final — the agent
+	// should NOT answer it; the plugin redraws the post with progress and waits
+	// for Submit. This stops the bot reacting to each select of a form separately
+	// (the exact UX Ivan flagged).
+	isFinal := isSubmit
+	if req.PostId != "" && !isFinal {
+		isFinal = p.postIsSingleAction(req.PostId)
+	}
+
 	// Always relay the accumulated form state for this post (all controls), so the
 	// agent sees progress across clicks. On a submit action the agent ALSO gets the
 	// full submission keyed by each control's question_id (all answers, one read).
@@ -263,12 +274,13 @@ func (p *Bridge) handleInteract(w http.ResponseWriter, r *http.Request) {
 		"type":            req.Type,
 		"data_source":     req.DataSource,
 		"form_state":      formState,
+		"final":           isFinal,
 	}
 	if isSubmit {
 		payload["submission"] = p.snapshotSubmission(req.PostId)
 	}
-	log.Printf("hermes-bridge interact action=%s submit=%t user=%s channel=%s",
-		actionID, isSubmit, req.UserId, req.ChannelId)
+	log.Printf("hermes-bridge interact action=%s submit=%t final=%t user=%s channel=%s",
+		actionID, isSubmit, isFinal, req.UserId, req.ChannelId)
 	p.API.PublishWebSocketEvent(wsExitInteract, payload, &model.WebsocketBroadcast{ChannelId: req.ChannelId})
 
 	// Submit: the form is complete — disable every control (final answer delivered).
