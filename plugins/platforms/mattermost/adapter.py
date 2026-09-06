@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import threading
 from pathlib import Path
 from urllib.parse import unquote as _unquote
 from typing import Any, Dict, List, Optional, Tuple
@@ -1700,6 +1701,80 @@ def _is_connected(config) -> bool:
         and (gateway_mod.get_env_value("MATTERMOST_URL") or "").strip())
 
 
+# ---------------------------------------------------------------------------
+# Interactive-acks: suppress the model's "I posted buttons/question" chatter.
+#
+# Weak models (e.g. deepseek-flash) follow send_interactive_message / send_dialog
+# with a narration of what they sent ("Отправил вопрос с вариантами"), which is
+# noise — the buttons/menu ARE the answer. We can't stop the agent turning (that
+# would require editing the core loop), BUT we can suppress the *delivered* final
+# reply using the plugin hook surface (no core changes):
+#
+#   1. ``post_tool_call`` — record per-session whether the JUST-completed tool call
+#      was a successful interactive send. The most-recent call wins, so the flag is
+#      True only when the LAST tool of the turn was a successful interactive send.
+#   2. ``transform_llm_output`` — before the final answer is delivered (fire once
+#      after the tool loop), if that flag is set for the session, replace the
+#      final_response with the ``[SILENT]`` sentinel. The gateway already treats
+#      ``[SILENT]`` as intentional silence (run_turn.py) and delivers nothing —
+#      exactly what we want: buttons on screen, no narration.
+#
+# Registration in ``register(ctx)`` below. Both hooks are best-effort and NEVER
+# raise; state is process-local and keyed by session so concurrent sessions don't
+# interfere. This is purely the interactive *ack*; ordinary typed replies still
+# deliver normally.
+_INTERACTIVE_TOOL_NAMES = {"send_interactive_message", "send_dialog"}
+_SILENT_SENTINEL = "[SILENT]"
+
+_suppress_lock = threading.Lock()
+# session_id -> True when the last tool call of the turn was a successful interactive send.
+_suppress_last_interactive: Dict[str, bool] = {}
+
+
+def _on_post_tool_call(tool_name: str = "", session_id: str = "", result: Any = None, **_: Any) -> None:
+    """Track whether the most recent tool call was a successful interactive send.
+
+    Runs for EVERY tool call (in order), so the final value before turn end is True
+    only when the LAST call was an interactive send. Any later non-interactive tool
+    (or a failed interactive call) resets the flag.
+    """
+    try:
+        if not session_id:
+            return
+        interactive_ok = False
+        if tool_name in _INTERACTIVE_TOOL_NAMES:
+            # result may be a JSON string (the tool handler's output) or a dict.
+            ok = False
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                    ok = bool(parsed.get("success"))
+                except Exception:
+                    ok = False
+            elif isinstance(result, dict):
+                ok = bool(result.get("success"))
+            interactive_ok = ok
+        with _suppress_lock:
+            _suppress_last_interactive[session_id] = interactive_ok
+    except Exception:  # noqa: BLE001 — a telemetry hook must never break the agent
+        return
+
+
+def _on_transform_llm_output(platform: str = "", session_id: str = "", **_: Any) -> Optional[str]:
+    """Suppress the interactive-send narration for the Mattermost platform."""
+    try:
+        if platform != "mattermost":
+            return None
+        with _suppress_lock:
+            suppress = _suppress_last_interactive.pop(session_id or "", False)
+        if suppress:
+            # Buttons are the answer; the model's "I sent..." narration must not be delivered.
+            return _SILENT_SENTINEL
+        return None
+    except Exception:  # noqa: BLE001 — never break the turn
+        return None
+
+
 # --- Plugin registration entry point ---
 
 def register(ctx) -> None:
@@ -1714,3 +1789,8 @@ def register(ctx) -> None:
         cron_deliver_env_var="MATTERMOST_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,  # out-of-process cron; without it `deliver=mattermost` fails
         max_message_length=MAX_POST_LENGTH, emoji="💬", allow_update_command=True)
+    # Suppress the interactive-send narration ("I posted buttons...") without touch
+    # ing core: post_tool_call records the last successful interactive send per
+    # session; transform_llm_output swaps the delivered reply for [SILENT] when set.
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("transform_llm_output", _on_transform_llm_output)

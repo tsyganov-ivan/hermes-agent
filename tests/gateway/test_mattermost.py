@@ -1726,3 +1726,70 @@ class TestMattermostInteractSimple:
         assert msg.raw_message.get("response_for_question_id") == "q_5"
         assert "form_state" not in msg.raw_message
         assert "submission" not in msg.raw_message
+
+
+# ---------------------------------------------------------------------------
+# Interactive-ack suppression hooks (post_tool_call + transform_llm_output)
+# ---------------------------------------------------------------------------
+
+def test_post_tool_call_tracks_last_interactive_success():
+    """post_tool_call records True only when the LAST call was a successful interactive send."""
+    from plugins.platforms.mattermost import adapter as mm_adapter
+    with mm_adapter._suppress_lock:
+        mm_adapter._suppress_last_interactive.clear()
+    # A successful interactive send sets the flag.
+    mm_adapter._on_post_tool_call(
+        tool_name="send_interactive_message", session_id="sess_1",
+        result='{"success": true, "question_id": "abc"}')
+    assert mm_adapter._suppress_last_interactive.get("sess_1") is True
+    # A later non-interactive tool call RESETS it (last-call-wins).
+    mm_adapter._on_post_tool_call(tool_name="todo", session_id="sess_1", result="{}")
+    assert mm_adapter._suppress_last_interactive.get("sess_1") is False
+    # A FAILED interactive send is not treated as suppressible.
+    mm_adapter._on_post_tool_call(
+        tool_name="send_interactive_message", session_id="sess_2",
+        result='{"success": false, "error": "no channel"}')
+    assert mm_adapter._suppress_last_interactive.get("sess_2") is False
+
+
+def test_post_tool_call_accepts_dict_result():
+    """Result may arrive as a dict (not always a JSON string)."""
+    from plugins.platforms.mattermost import adapter as mm_adapter
+    mm_adapter._on_post_tool_call(
+        tool_name="send_dialog", session_id="sess_d", result={"success": True, "question_id": "q"})
+    assert mm_adapter._suppress_last_interactive.get("sess_d") is True
+
+
+def test_transform_llm_output_suppresses_mattermost_only():
+    """transform_llm_output returns [SILENT] only for mattermost + a set flag."""
+    from plugins.platforms.mattermost import adapter as mm_adapter
+    mm_adapter._suppress_last_interactive.clear()
+    # Flag set for a mattermost session → suppress with the sentinel.
+    mm_adapter._suppress_last_interactive["sess_1"] = True
+    assert mm_adapter._on_transform_llm_output(
+        platform="mattermost", session_id="sess_1", response_text="Отправил кнопки") == "[SILENT]"
+    # Flag consumed on read → second call does nothing.
+    assert mm_adapter._on_transform_llm_output(platform="mattermost", session_id="sess_1") is None
+    # Other platforms are never touched even with a set flag.
+    mm_adapter._suppress_last_interactive["sess_2"] = True
+    assert mm_adapter._on_transform_llm_output(platform="telegram", session_id="sess_2") is None
+    # No flag → no suppression.
+    assert mm_adapter._on_transform_llm_output(platform="mattermost", session_id="sess_3") is None
+
+
+def test_registration_wires_suppress_hooks():
+    """register(ctx) attaches both hooks so the suppression is active."""
+    from plugins.platforms.mattermost import adapter as mm_adapter
+    registered = []
+
+    class _Ctx:
+        def register_platform(self, **kw):
+            registered.append(("platform", kw.get("name")))
+
+        def register_hook(self, name, fn):
+            registered.append(("hook", name, fn))
+
+    mm_adapter.register(_Ctx())
+    names = [r[1] for r in registered if r[0] == "hook"]
+    assert "post_tool_call" in names
+    assert "transform_llm_output" in names
