@@ -8,6 +8,18 @@ behind NAT:
 - **Slash commands** → `ExecuteCommand` hook → `PublishWebSocketEvent("hermes_bridge_command", …, broadcast={ChannelId})` targeting the channel the command ran in.
 - **Buttons/menus** → MM server POSTs locally to `/plugins/<plugin_id>/interact` →
   `ServeHTTP` → `PublishWebSocketEvent("hermes_bridge_interact", …)`.
+
+**Interactive model is deliberately simple (finalized 2026-09-06):** a post is **EITHER
+several buttons OR one select menu — never both** (mixing is rejected by
+`adapter.send_interactive`). There is NO multi-control form accumulation, NO Submit
+button, and NO `form_state`/`submission`/`final` in the WS payload. Every click/selection
+is a FINAL choice: the plugin relays `hermes_bridge_interact` (`action_id` +
+`selected_option`/`label`) then disables-after-pick on the post (clears the `actions[]`
+so no second choice). The plugin holds no state and never rewrites a live post's actions.
+Why: MM strips `actions[].integration` on `GET /posts` and `PUT /posts/{id}/patch` fully
+replaces props — a round-trip redraw wipes every button (the earlier stateful form
+machinery was removed for this reason). Multi-field forms belong in native dialogs
+(`send_dialog`/`OpenInteractiveDialog`), which the plugin relays without touching posts.
 - **Interactive dialogs** (2 hops, both dumb):
   1. `POST /plugins/<plugin_id>/interact` with a `context.dialog` schema (posted by Hermes).
      `handleInteract` sees the key and calls `p.API.OpenInteractiveDialog({TriggerId,
