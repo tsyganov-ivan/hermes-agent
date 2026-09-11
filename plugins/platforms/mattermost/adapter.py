@@ -219,6 +219,20 @@ class MattermostAdapter(BasePlatformAdapter):
         # note (no visible reply); true responds actively with a full agent turn in the thread.
         _reply_rx = (config.extra.get("reaction_reply", "") or _get_scoped_secret("MATTERMOST_REACTION_REPLY", "false"))
         self._reaction_reply: bool = str(_reply_rx).strip().lower() in {"1", "true", "yes", "on"}
+        # Collapsible progress: when the display setting ``tool_progress_grouping`` is
+        # "overwrite", the FINAL reply overwrites the live progress bubble in place
+        # (one post — progress becomes the answer) instead of posting a second message.
+        # Driven from the standard grouping knob (display.platforms.mattermost.tool_progress_grouping),
+        # not a bespoke flag; resolve_display_setting honors per-platform display overrides.
+        try:
+            from gateway.display_config import resolve_display_setting
+            from gateway.platforms.base import _config_section
+            _grouping = resolve_display_setting(
+                {"display": _config_section("display")},
+                "mattermost", "tool_progress_grouping") or "accumulate"
+        except Exception:
+            _grouping = "accumulate"
+        self._collapse_progress: bool = _grouping == "overwrite"
         # Per-channel last inbound post, so react without an explicit message_id targets the
         # conversation's own most recent message instead of (incorrectly) the home channel.
         self._last_inbound_by_chat: Dict[str, str] = {}
@@ -233,6 +247,16 @@ class MattermostAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Cached fallback team for post search (GET /teams); resolved lazily.
         self._default_team_cache: Optional[str] = None
+        # Collapsible-progress state: a live tool/status bubble keyed by (chat_id,
+        # thread_id) that the FINAL answer overwrites in place (edit_message) instead
+        # of posting a second message. Keyed identically on the progress send and the
+        # final send, so no guessing — both carry the same thread_id in metadata.
+        self._transient_posts: Dict[Tuple[str, Optional[str]], str] = {}
+        # Post ids already collapsed into a final answer (per key). Guards the racing
+        # progress drain: a late progress-lane edit_message on a collapsed id is a no-op
+        # so it cannot overwrite the final answer. Cleaned when a fresh progress bubble
+        # starts for the same key.
+        self._finalized_transient: Dict[Tuple[str, Optional[str]], str] = {}
 
     # --- HTTP helpers ---
 
@@ -542,58 +566,22 @@ class MattermostAdapter(BasePlatformAdapter):
                 })
         if not actions:
             return SendResult(success=False, error="send_interactive: no valid actions")
-        base: Dict[str, Any] = {"channel_id": chat_id, "message": ""}
-        payload = _with_mentions_disabled(base)
-        payload["props"] = {**(payload.get("props") or {}),
-                            "attachments": [{"text": text, "actions": actions}]}
+        # NOTE: do NOT apply _with_mentions_disabled here. Setting
+        # props.disable_mentions on an interactive post breaks its
+        # buttons/menu: clicking yields 'Sorry, we could not find the page.'
+        # (the click action never reaches the plugin) — MM's webapp can't fire
+        # the callback for a post carrying that prop. Reverts a regression that
+        # reintroduced the prop in send_interactive/send_dialog. Keep this post
+        # free of it: payload = {"channel_id","message":"","props":{"attachments":[...]}}.
+        payload: Dict[str, Any] = {
+            "channel_id": chat_id,
+            "message": "",
+            "props": {"attachments": [{"text": text, "actions": actions}]},
+        }
         if reply_to:
             payload["root_id"] = await self._resolve_root_id(reply_to)
         result = await self._api_post("posts", payload)
         return _post_result(result, "Failed to create interactive post")
-
-    async def send_dialog(
-            self, chat_id: str, text: str, dialog: Dict[str, Any], *,
-            reply_to: Optional[str] = None,
-            question_id: Optional[str] = None,
-            button_label: Optional[str] = None,
-            metadata: _Metadata = None) -> SendResult:
-        """Send a post with a button that opens an interactive dialog on click.
-
-        The full dialog schema (``model.Dialog`` minus ``trigger_id``/``url``):
-        ``{title, callback_id, state, introduction_text, submit_label, elements:
-        [{name, display_name, type, subtype, placeholder, optional, default,
-        options:[{text,value}]}]}`` rides in the button's ``integration.context``
-        under key ``dialog``. On click the native plugin sees that key, opens the
-        dialog (via ``trigger_id``) and later relays the ``SubmitDialogRequest``
-        back as a ``hermes_bridge_dialog`` WS event. ``question_id`` is both put in
-        the button context and used as the dialog ``state`` so the submit can be
-        correlated back to this question.
-        """
-        if not dialog:
-            return SendResult(success=False, error="send_dialog requires a dialog schema")
-        bid = str(dialog.get("callback_id") or "dialog").strip() or "dialog"
-        label = str(button_label or dialog.get("submit_label") or "Заполнить форму")
-        ctx: Dict[str, Any] = {"action_id": bid}
-        if question_id:
-            ctx["question_id"] = question_id
-        if text:
-            # Embed the question so the submit tell the model WHAT it answers.
-            ctx["question"] = text
-        if question_id and not dialog.get("state"):
-            dlg = dict(dialog)
-            dlg["state"] = question_id
-            dialog = dlg
-        ctx["dialog"] = dialog
-        payload = _with_mentions_disabled(
-            {"channel_id": chat_id, "message": "",
-             "props": {"attachments": [{"text": text, "actions": [
-                 {"id": bid, "type": "button", "name": label, "style": "primary",
-                  "integration": {"url": self._bridge_interact_url(), "context": ctx},
-                  }, ]}]}})
-        if reply_to:
-            payload["root_id"] = await self._resolve_root_id(reply_to)
-        result = await self._api_post("posts", payload)
-        return _post_result(result, "Failed to create dialog post")
 
     async def send_ephemeral(self, chat_id: str, user_id: str, text: str, *,
                              metadata: _Metadata = None) -> SendResult:
@@ -693,14 +681,55 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
-        """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
+        """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post.
+
+        Collapse-progress behaviour: a non-notify send (tool/status bubble, keyed by
+        the same (chat_id, thread_id) as the eventual final reply) remembers its post
+        id; when the FINAL notify send arrives, it overwrites that bubble in place via
+        ``edit_message`` instead of posting a second message — the channel keeps ONE
+        post (progress becomes the answer). Falls back to a normal partitioned send
+        when the final is too long to edit (single runner chunk) or no progress bubble
+        is pending. The registry entry is always cleaned (pop) on the final path.
+        """
         if not content:
             return SendResult(success=True)
+        thread_id = str(metadata.get("thread_id")) if isinstance(metadata, dict) and metadata.get("thread_id") else None
+        key = (chat_id, thread_id)
+        is_final = bool(isinstance(metadata, dict) and metadata.get("notify"))
+        collapse = self._collapse_progress
+
+        if is_final and collapse:
+            saved_id = self._transient_posts.get(key)
+            if saved_id:
+                # Overwrite the saved bubble with the FIRST runner chunk, then append
+                # any overflow as additional posts. The bubble never dangles as a
+                # half-updated progress line; it becomes the final answer.
+                chunks = self.truncate_message(self.format_message(content), MAX_POST_LENGTH)
+                result = await self.edit_message(chat_id, saved_id, chunks[0], finalize=True)
+                for chunk in chunks[1:]:
+                    result = _post_result(
+                        await self._post_message(chat_id, chunk, reply_to, metadata),
+                        "Failed to create post")
+                self._transient_posts.pop(key, None)
+                if result.success:
+                    # The bubble now carries the final answer; a late progress-lane
+                    # edit of the SAME id must be a no-op so it can't overwrite it.
+                    self._finalized_transient[key] = saved_id
+                    return result
+                # Edit/partition failed: fall through to a fresh post, but the
+                # stale bubble reference is already dropped.
         result = SendResult(success=True)
         for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
             result = _post_result(await self._post_message(chat_id, chunk, reply_to, metadata), "Failed to create post")
             if not result.success:
                 break
+        # Remember non-notify (progress/status) posts so the final reply can reclaim
+        # the bubble in overwrite mode. Only the first chunk of a progressive bubble
+        # is tracked (the collapse target); a fresh key starts by clearing any
+        # finalized marker. Skipped when collapse is off so the registry stays empty.
+        if not is_final and collapse and result.success and result.message_id:
+            self._finalized_transient.pop(key, None)
+            self._transient_posts.setdefault(key, result.message_id)
         return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -716,6 +745,12 @@ class MattermostAdapter(BasePlatformAdapter):
         await self._api_post(f"users/{self._bot_user_id}/typing", {"channel_id": chat_id})
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        # A late progress-lane edit of a post that the final answer already collapsed
+        # into must be a no-op — otherwise the racing progress drain overwrites the
+        # delivered final reply with a stale "⚙ cmd..." status line. Same id == same
+        # bubble; no guessing.
+        if any(message_id == fid for fid in self._finalized_transient.values()):
+            return SendResult(success=True, message_id=message_id)
         payload = _with_mentions_disabled({"message": self.format_message(content)})
         return _post_result(await self._api("PUT", f"posts/{message_id}/patch", payload), "Failed to edit post")
 
@@ -1443,50 +1478,6 @@ class MattermostAdapter(BasePlatformAdapter):
                          "selected_option": selected,
                          "response_for_question_id": question_id or None}))
 
-    async def _handle_bridge_dialog(self, data: Dict[str, Any]) -> None:
-        """Handle a `hermes_bridge_dialog` WS event from the native plugin.
-
-        The user submitted/cancelled an interactive dialog the bot opened. The
-        plugin relayed the SubmitDialogRequest verbatim: callback_id, state,
-        submission ({field_name: value}), cancelled. Build a MessageEvent so the
-        agent sees the filled form as structured input in ``raw_message`` and a
-        human-readable summary in the text. ``state`` carries the bot's own
-        question_id (echoed back), ``callback_id`` names the dialog form.
-        """
-        from gateway.platforms.base import MessageEvent, MessageType
-        channel_id = str(data.get("channel_id") or "").strip()
-        user_id = str(data.get("user_id") or "").strip()
-        user_name = str(data.get("user_name") or "").lstrip("@") or user_id
-        callback_id = str(data.get("callback_id") or "").strip()
-        state = str(data.get("state") or "").strip()
-        submission = data.get("submission")
-        cancelled = bool(data.get("cancelled"))
-        if not channel_id:
-            logger.warning("Mattermost: hermes_bridge_dialog missing channel: %s", data)
-            return
-        if not isinstance(submission, dict):
-            submission = {}
-        channel_code = await self._channel_type_code(channel_id)
-        source = self.build_source(
-            chat_id=channel_id,
-            chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
-            user_id=user_id, user_name=user_name,
-            thread_id=None, message_id=None)
-        if cancelled:
-            text = f"[Dialog cancelled] {callback_id or 'dialog'}"
-        else:
-            items = ", ".join(f"{k}={v}" for k, v in submission.items()) if submission else "(no fields)"
-            text = f"[Dialog submitted] {callback_id or 'dialog'}: {items}"
-        logger.info("Mattermost: bridge dialog callback=%s cancelled=%s from %s in %s",
-                    callback_id, cancelled, user_name, channel_id)
-        await self.handle_message(MessageEvent(
-            text=text, message_type=MessageType.TEXT, source=source, message_id=None,
-            raw_message={"callback_id": callback_id,
-                         "state": state or None,
-                         "submission": submission,
-                         "cancelled": cancelled,
-                         "response_for_question_id": state or None}))
-
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         evt_kind = event.get("event")
         # Custom plugin WS events arrive namespaced by the server:
@@ -1499,16 +1490,11 @@ class MattermostAdapter(BasePlatformAdapter):
                                        or evt_kind.endswith("_hermes_bridge_command"))
         bridge_interact = evt_kind and (evt_kind == "hermes_bridge_interact"
                                         or evt_kind.endswith("_hermes_bridge_interact"))
-        bridge_dialog = evt_kind and (evt_kind == "hermes_bridge_dialog"
-                                      or evt_kind.endswith("_hermes_bridge_dialog"))
         if bridge_command:
             await self._handle_bridge_command(event.get("data", {}))
             return
         if bridge_interact:
             await self._handle_bridge_interact(event.get("data", {}))
-            return
-        if bridge_dialog:
-            await self._handle_bridge_dialog(event.get("data", {}))
             return
         if evt_kind != "posted":
             return
@@ -1714,7 +1700,7 @@ def _is_connected(config) -> bool:
 # ---------------------------------------------------------------------------
 # Interactive-acks: suppress the model's "I posted buttons/question" chatter.
 #
-# Weak models (e.g. deepseek-flash) follow send_interactive_message / send_dialog
+# Weak models (e.g. deepseek-flash) follow send_interactive_message
 # with a narration of what they sent ("Отправил вопрос с вариантами"), which is
 # noise — the buttons/menu ARE the answer. We can't stop the agent turning (that
 # would require editing the core loop), BUT we can suppress the *delivered* final
@@ -1733,7 +1719,7 @@ def _is_connected(config) -> bool:
 # raise; state is process-local and keyed by session so concurrent sessions don't
 # interfere. This is purely the interactive *ack*; ordinary typed replies still
 # deliver normally.
-_INTERACTIVE_TOOL_NAMES = {"send_interactive_message", "send_dialog"}
+_INTERACTIVE_TOOL_NAMES = {"send_interactive_message"}
 _SILENT_SENTINEL = "[SILENT]"
 
 _suppress_lock = threading.Lock()

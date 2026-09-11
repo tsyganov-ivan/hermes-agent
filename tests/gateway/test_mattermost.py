@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
+from plugins.platforms.mattermost.adapter import MAX_POST_LENGTH, SendResult
 from gateway.run import (
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
@@ -261,6 +262,112 @@ class TestMattermostSend:
         assert self.adapter._api_post.call_count == 1
         payload = self.adapter._api_post.call_args_list[0][0][1]
         assert payload["root_id"] == "bad_root"
+
+    # --- Collapsible progress: final reply overwrites the progress bubble in place ---
+
+    @pytest.mark.asyncio
+    async def test_progress_send_remembers_bubble_and_final_overwrites_it(self):
+        """A tool/status bubble (no notify) is recorded; the final notify send edits that
+        same post in place instead of posting a second message, and cleans the registry."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._collapse_progress = True
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        # Progress bubble post
+        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
+        progress = await self.adapter.send(
+            "channel_1", "⚙️ terminal...", metadata={"thread_id": "root_post"})
+        assert progress.success is True
+        assert progress.message_id == "progress_post_1"
+        assert self.adapter._transient_posts.get(("channel_1", "root_post")) == "progress_post_1"
+
+        # Final reply: should EDIT the bubble, not POST a new message.
+        self.adapter.edit_message = AsyncMock(
+            return_value=SendResult(success=True, message_id="progress_post_1"))
+        final = await self.adapter.send(
+            "channel_1", "Done — here is the answer.",
+            metadata={"thread_id": "root_post", "notify": True},
+        )
+
+        assert final.success is True
+        assert final.message_id == "progress_post_1"
+        self.adapter.edit_message.assert_awaited_once_with(
+            "channel_1", "progress_post_1", "Done — here is the answer.", finalize=True)
+        # No new post for the collapsed final.
+        assert self.adapter._api_post.call_count == 1
+        # Only the original progress post was created; nothing in the registry is left.
+        assert ("channel_1", "root_post") not in self.adapter._transient_posts
+        # And a late edit of the collapsed bubble is suppressed so it can't clobber the final.
+        self.adapter._api = AsyncMock(return_value={"id": "progress_post_1"})
+        late = await self.adapter.edit_message("channel_1", "progress_post_1", "⚙ stale")
+        assert late.success is True
+        self.adapter._api.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_final_without_progress_bubble_posts_normally(self):
+        """No live bubble for the key -> the final reply posts as a normal message."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "final_post_1"})
+
+        result = await self.adapter.send(
+            "channel_1", "Just the answer.", metadata={"thread_id": "root_post", "notify": True})
+
+        assert result.success is True
+        assert result.message_id == "final_post_1"
+        assert self.adapter._api_post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_accumulate_mode_does_not_track_or_collapse_progress(self):
+        """collapse off (default accumulate): progress posts post normally and are NOT
+        remembered, so the registry never grows and the final is a fresh post."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._collapse_progress = False
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
+
+        progress = await self.adapter.send(
+            "channel_1", "⚙️ terminal...", metadata={"thread_id": "root_post"})
+
+        assert progress.success is True
+        assert ("channel_1", "root_post") not in self.adapter._transient_posts
+        assert not self.adapter._finalized_transient
+
+        self.adapter._api_post = AsyncMock(return_value={"id": "final_post_1"})
+        self.adapter.edit_message = AsyncMock(
+            return_value=SendResult(success=True, message_id="progress_post_1"))
+        final = await self.adapter.send(
+            "channel_1", "Done.", metadata={"thread_id": "root_post", "notify": True})
+
+        assert final.success is True
+        assert final.message_id == "final_post_1"
+        self.adapter.edit_message.assert_not_awaited()
+        assert not self.adapter._transient_posts
+        assert not self.adapter._finalized_transient
+
+    @pytest.mark.asyncio
+    async def test_final_overwrites_long_answer_and_appends_overflow(self):
+        """When the final is longer than one post, the first runner chunk edits the bubble
+        and the remaining chunks append as fresh posts."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._collapse_progress = True
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
+        await self.adapter.send("channel_1", "⚙️ work...", metadata={"thread_id": "root_post"})
+
+        long_answer = "x" * MAX_POST_LENGTH + "y" * 50  # spans two chunks
+        self.adapter.edit_message = AsyncMock(
+            return_value=SendResult(success=True, message_id="progress_post_1"))
+        final = await self.adapter.send(
+            "channel_1", long_answer, metadata={"thread_id": "root_post", "notify": True})
+
+        assert final.success is True
+        # First chunk edits the bubble...
+        edited_content = self.adapter.edit_message.await_args.args[2]
+        assert len(edited_content) <= MAX_POST_LENGTH
+        # ...overflow posts as a second message.
+        assert self.adapter._api_post.call_count == 2
+        assert ("channel_1", "root_post") not in self.adapter._transient_posts
+        assert self.adapter._finalized_transient.get(("channel_1", "root_post")) == "progress_post_1"
 
 
 # ---------------------------------------------------------------------------
@@ -1254,6 +1361,11 @@ class TestMattermostInteractiveSend:
         # Text must appear only in the attachment card, never duplicated as the
         # post message too (else the question renders twice).
         assert payload["message"] == ""
+        # The interactive post must NOT carry props.disable_mentions — that prop
+        # breaks the button click (webapp falls to a 404 page, the action never
+        # reaches the plugin). Props should hold only the attachments card.
+        assert "disable_mentions" not in payload["props"]
+        assert set(payload["props"].keys()) == {"attachments"}
         attach = payload["props"]["attachments"][0]
         assert attach["text"] == "Pick one"
         actions = attach["actions"]
@@ -1643,103 +1755,6 @@ class TestMattermostChoicePicker:
 
 
 # ---------------------------------------------------------------------------
-# Bridge: interactive dialogs (hermes_bridge_dialog WS event + send_dialog)
-# ---------------------------------------------------------------------------
-
-class TestMattermostBridgeDialog:
-
-    def _adapter(self, **extra):
-        from plugins.platforms.mattermost.adapter import MattermostAdapter
-        config = PlatformConfig(
-            enabled=True, token="test-token",
-            extra={"url": "https://mm.example.com", **extra},
-        )
-        a = MattermostAdapter(config)
-        a._bot_user_id = "bot_id"
-        a._channel_type_code = AsyncMock(return_value="O")
-        a.handle_message = AsyncMock()
-        a._api_post = AsyncMock(return_value={"id": "post_9"})
-        a._api = AsyncMock(return_value={})
-        return a
-
-    @pytest.mark.asyncio
-    async def test_bridge_dialog_submit_builds_text_event(self):
-        a = self._adapter()
-        evt = {"event": "hermes_bridge_dialog", "data": {
-            "callback_id": "report", "state": "qid_abc",
-            "submission": {"summary": "All good", "priority": "high"},
-            "cancelled": False,
-            "user_id": "u_submit", "user_name": "sam", "channel_id": "chan_9",
-        }}
-        await a._handle_ws_event(evt)
-        a.handle_message.assert_awaited_once()
-        msg = a.handle_message.await_args.args[0]
-        assert msg.message_type == MessageType.TEXT
-        assert "All good" in msg.text
-        assert msg.source.chat_id == "chan_9"
-        assert msg.source.user_id == "u_submit"
-        assert msg.raw_message["callback_id"] == "report"
-        assert msg.raw_message["submission"]["priority"] == "high"
-        assert msg.raw_message["response_for_question_id"] == "qid_abc"
-
-    @pytest.mark.asyncio
-    async def test_bridge_dialog_cancel_builds_text_event(self):
-        a = self._adapter()
-        evt = {"event": "hermes_bridge_dialog", "data": {
-            "callback_id": "report", "state": "qid_abc",
-            "submission": {}, "cancelled": True,
-            "user_id": "u_submit", "user_name": "sam", "channel_id": "chan_9",
-        }}
-        await a._handle_ws_event(evt)
-        msg = a.handle_message.await_args.args[0]
-        assert "cancelled" in msg.text.lower()
-        assert msg.raw_message["cancelled"] is True
-
-    @pytest.mark.asyncio
-    async def test_bridge_dialog_namespaced_prefix_still_hits(self):
-        """Server namespaces plugin events: custom_<plugin_id>_<event>."""
-        a = self._adapter()
-        evt = {"event": "custom_hermes-bridge_hermes_bridge_dialog", "data": {
-            "callback_id": "c", "submission": {"x": "1"},
-            "cancelled": False, "user_id": "u", "channel_id": "chan_9",
-        }}
-        await a._handle_ws_event(evt)
-        a.handle_message.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_bridge_dialog_missing_channel_dropped(self):
-        a = self._adapter()
-        await a._handle_ws_event({"event": "hermes_bridge_dialog", "data": {
-            "callback_id": "c", "submission": {}, "cancelled": False}})
-        a.handle_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_send_dialog_posts_dialog_button(self):
-        a = self._adapter()
-        dialog = {"callback_id": "report", "title": "Report", "submit_label": "Send",
-                  "elements": [{"name": "summary", "display_name": "Summary", "type": "textarea"}]}
-        result = await a.send_dialog("chan_9", "Please report", dialog, question_id="qid_abc")
-        assert result.success
-        a._api_post.assert_awaited_once()
-        payload = a._api_post.call_args.args[1]
-        action = payload["props"]["attachments"][0]["actions"][0]
-        assert action["id"] == "report"
-        assert action["type"] == "button"
-        # The dialog schema rides in integration.context under key "dialog".
-        assert action["integration"]["context"]["dialog"]["callback_id"] == "report"
-        assert action["integration"]["context"]["dialog"]["elements"][0]["type"] == "textarea"
-        # question_id is both in the button context and used as dialog state.
-        assert action["integration"]["context"]["question_id"] == "qid_abc"
-        assert action["integration"]["context"]["dialog"]["state"] == "qid_abc"
-
-    @pytest.mark.asyncio
-    async def test_send_dialog_requires_schema(self):
-        a = self._adapter()
-        result = await a.send_dialog("chan_9", "text", {})
-        assert not result.success
-        a._api_post.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # bridge interact: every click is a final TEXT choice (no form accumulation)
 # ---------------------------------------------------------------------------
@@ -1825,7 +1840,7 @@ def test_post_tool_call_accepts_dict_result():
     """Result may arrive as a dict (not always a JSON string)."""
     from plugins.platforms.mattermost import adapter as mm_adapter
     mm_adapter._on_post_tool_call(
-        tool_name="send_dialog", session_id="sess_d", result={"success": True, "question_id": "q"})
+        tool_name="send_interactive_message", session_id="sess_d", result={"success": True, "question_id": "q"})
     assert mm_adapter._suppress_last_interactive.get("sess_d") is True
 
 
