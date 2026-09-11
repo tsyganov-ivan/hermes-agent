@@ -219,11 +219,12 @@ class MattermostAdapter(BasePlatformAdapter):
         # note (no visible reply); true responds actively with a full agent turn in the thread.
         _reply_rx = (config.extra.get("reaction_reply", "") or _get_scoped_secret("MATTERMOST_REACTION_REPLY", "false"))
         self._reaction_reply: bool = str(_reply_rx).strip().lower() in {"1", "true", "yes", "on"}
-        # Collapsible progress: when the display setting ``tool_progress_grouping`` is
-        # "overwrite", the FINAL reply overwrites the live progress bubble in place
-        # (one post — progress becomes the answer) instead of posting a second message.
-        # Driven from the standard grouping knob (display.platforms.mattermost.tool_progress_grouping),
-        # not a bespoke flag; resolve_display_setting honors per-platform display overrides.
+        # Collapsible progress: with the display setting ``tool_progress_grouping`` at
+        # "accumulate" (the default) the FINAL reply overwrites the live progress bubble
+        # in place (one post — progress becomes the answer) instead of posting a second
+        # message. Driven from the standard grouping knob
+        # (display.platforms.mattermost.tool_progress_grouping), not a bespoke flag;
+        # resolve_display_setting honors per-platform display overrides.
         try:
             from gateway.display_config import resolve_display_setting
             from gateway.platforms.base import _config_section
@@ -232,7 +233,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 "mattermost", "tool_progress_grouping") or "accumulate"
         except Exception:
             _grouping = "accumulate"
-        self._collapse_progress: bool = _grouping == "overwrite"
+        self._collapse_progress: bool = _grouping == "accumulate"
         # Per-channel last inbound post, so react without an explicit message_id targets the
         # conversation's own most recent message instead of (incorrectly) the home channel.
         self._last_inbound_by_chat: Dict[str, str] = {}
@@ -724,7 +725,7 @@ class MattermostAdapter(BasePlatformAdapter):
             if not result.success:
                 break
         # Remember non-notify (progress/status) posts so the final reply can reclaim
-        # the bubble in overwrite mode. Only the first chunk of a progressive bubble
+        # the bubble in collapse mode. Only the first chunk of a progressive bubble
         # is tracked (the collapse target); a fresh key starts by clearing any
         # finalized marker. Skipped when collapse is off so the registry stays empty.
         if not is_final and collapse and result.success and result.message_id:

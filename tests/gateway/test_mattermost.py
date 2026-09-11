@@ -317,11 +317,12 @@ class TestMattermostSend:
         assert self.adapter._api_post.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_accumulate_mode_does_not_track_or_collapse_progress(self):
-        """collapse off (default accumulate): progress posts post normally and are NOT
-        remembered, so the registry never grows and the final is a fresh post."""
+    async def test_accumulate_mode_collapses_progress(self):
+        """'accumulate' (the default) IS collapse: a progress bubble is remembered and
+        the final reply overwrites it in place. That toggle comes from the display
+        setting, not a bespoke flag — the adapter resolves it in __init__."""
         self.adapter._reply_mode = "thread"
-        self.adapter._collapse_progress = False
+        self.adapter._collapse_progress = True  # == grouping=="accumulate"
         self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
         self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
 
@@ -329,20 +330,19 @@ class TestMattermostSend:
             "channel_1", "⚙️ terminal...", metadata={"thread_id": "root_post"})
 
         assert progress.success is True
-        assert ("channel_1", "root_post") not in self.adapter._transient_posts
-        assert not self.adapter._finalized_transient
+        assert self.adapter._transient_posts.get(("channel_1", "root_post")) == "progress_post_1"
 
-        self.adapter._api_post = AsyncMock(return_value={"id": "final_post_1"})
         self.adapter.edit_message = AsyncMock(
             return_value=SendResult(success=True, message_id="progress_post_1"))
         final = await self.adapter.send(
             "channel_1", "Done.", metadata={"thread_id": "root_post", "notify": True})
 
-        assert final.success is True
-        assert final.message_id == "final_post_1"
-        self.adapter.edit_message.assert_not_awaited()
-        assert not self.adapter._transient_posts
-        assert not self.adapter._finalized_transient
+        assert final.message_id == "progress_post_1"
+        self.adapter.edit_message.assert_awaited_once()
+        assert ("channel_1", "root_post") not in self.adapter._transient_posts
+        # The collapsed bubble's id is retained as the finalized marker so a racing
+        # late progress-lane edit of it becomes a no-op (can't clobber the final).
+        assert self.adapter._finalized_transient.get(("channel_1", "root_post")) == "progress_post_1"
 
     @pytest.mark.asyncio
     async def test_final_overwrites_long_answer_and_appends_overflow(self):
