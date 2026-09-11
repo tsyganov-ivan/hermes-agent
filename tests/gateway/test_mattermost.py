@@ -936,6 +936,9 @@ class TestMattermostBridgeEvents:
         a._bot_user_id = "bot_id"
         a._channel_type_code = AsyncMock(return_value="O")
         a.handle_message = AsyncMock()
+        # _handle_bridge_interact resolves the interactive post's root_id to key the click into
+        # the agent's thread; default to a non-threaded post (no root_id).
+        a._api_get = AsyncMock(return_value={"id": "post_1", "root_id": ""})
         return a
 
     def _cmd_evt(self, **over):
@@ -1031,6 +1034,41 @@ class TestMattermostBridgeEvents:
         await a._handle_ws_event(evt)
         msg = a.handle_message.await_args.args[0]
         assert msg.text == "Отмена"
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_keys_click_into_the_agent_thread(self):
+        """A button click must route into the SAME thread session the agent posted into.
+
+        send_interactive sends the control with the agent thread's root_id; the click event
+        carries only post_id, so the adapter must resolve the post's root_id and use it as the
+        session thread_id. Otherwise the click lands in the channel-root session — a different
+        agent/session than the one that posted the buttons.
+        """
+        a = self._bridge_adapter()
+        a._api_get = AsyncMock(return_value={"id": "post_1", "root_id": "root_abc"})
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "go", "label": "Paris", "post_id": "post_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "go", "label": "Paris", "question": "Capitale?"},
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert msg.source.thread_id == "root_abc"
+        assert msg.source.chat_id == "chan_9"
+
+    @pytest.mark.asyncio
+    async def test_bridge_interact_channel_root_post_has_no_thread(self):
+        """A control posted at channel root (no root_id) keys to the channel session."""
+        a = self._bridge_adapter()
+        a._api_get = AsyncMock(return_value={"id": "post_1", "root_id": ""})
+        evt = {"event": "hermes_bridge_interact", "data": {
+            "action_id": "go", "label": "Paris", "post_id": "post_1",
+            "channel_id": "chan_9", "user_id": "bob",
+            "context": {"action_id": "go", "label": "Paris"},
+        }}
+        await a._handle_ws_event(evt)
+        msg = a.handle_message.await_args.args[0]
+        assert msg.source.thread_id is None
 
     @pytest.mark.asyncio
     async def test_bridge_command_namespaced_prefix_still_hits(self):
@@ -1718,6 +1756,7 @@ class TestMattermostInteractSimple:
         a._bot_user_id = "bot_id"
         a._channel_type_code = AsyncMock(return_value="O")
         a.handle_message = AsyncMock()
+        a._api_get = AsyncMock(return_value={"id": "post_1", "root_id": ""})
         return a
 
     @pytest.mark.asyncio

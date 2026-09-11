@@ -1406,11 +1406,21 @@ class MattermostAdapter(BasePlatformAdapter):
                 "channel_id": channel_id, "user_id": user_id})
             return
         channel_code = await self._channel_type_code(channel_id)
+        # Resolve the thread the interactive post lives in so the click lands in the SAME
+        # session as the agent that posted the buttons (send_interactive sends with root_id of
+        # the agent's thread). Without this, thread_id=None keys the click to the channel-root
+        # session — a different agent/session (and potentially a stale credential) than the one
+        # actually answering. Fall back to None (channel-root) when the post is not in a thread.
+        thread_id: Optional[str] = None
+        if post_id:
+            post_data = await self._api_get(f"posts/{post_id}")
+            if post_data and post_data.get("root_id"):
+                thread_id = str(post_data["root_id"]).strip() or None
         source = self.build_source(
             chat_id=channel_id,
             chat_type=_CHANNEL_TYPE_MAP.get(channel_code, "channel"),
             user_id=user_id, user_name=user_name,
-            thread_id=None, message_id=post_id)
+            thread_id=thread_id, message_id=post_id)
         # Both buttons and menus deliver the user's choice as plain TEXT so the
         # agent sees the picked label/value, not an invented slash command.
         label = str(context.get("label") or "").strip() if isinstance(context, dict) else ""
