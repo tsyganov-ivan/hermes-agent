@@ -1382,6 +1382,32 @@ class TestMattermostInteractiveSend:
         assert actions[1]["id"] == "no"
 
     @pytest.mark.asyncio
+    async def test_send_interactive_sanitizes_underscore_action_ids(self):
+        """Mattermost web clicks hit /posts/{pid}/actions/{action_id} where action_id
+        is actions[].id — and that id MUST be letters+digits only (the web app 404s on
+        underscore/space, so nothing reaches the bridge plugin). send_interactive must
+        sanitize every button id to alphanumeric and keep the model-facing id in the
+        integration context (raw_action_id) for correlation."""
+        a = self._adapter()
+        a._api_post = AsyncMock(return_value={"id": "post_int_2"})
+        res = await a.send_interactive(
+            "chan_9", "Pick", buttons=[
+                {"id": "option_1", "label": "A"},
+                {"id": "option-2", "label": "B"},
+            ])
+        assert res.success is True
+        actions = a._api_post.call_args.args[1]["props"]["attachments"][0]["actions"]
+        # ids must be web-click-safe (alnum only)
+        assert all(aid.isalnum() for aid in [x["id"] for x in actions])
+        # distinct model ids never collapse into the same sanitized id
+        ids = [x["id"] for x in actions]
+        assert len(ids) == len(set(ids)) == 2
+        # original model ids are preserved in each action's context for correlation
+        assert actions[0]["integration"]["context"]["action_id"] == "option1"
+        assert actions[0]["integration"]["context"]["raw_action_id"] == "option_1"
+        assert actions[1]["integration"]["context"]["raw_action_id"] == "option-2"
+
+    @pytest.mark.asyncio
     async def test_send_interactive_builds_menu_payload(self):
         a = self._adapter()
         a._api_post = AsyncMock(return_value={"id": "post_int_1"})

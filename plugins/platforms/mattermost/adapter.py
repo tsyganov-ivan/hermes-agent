@@ -52,6 +52,20 @@ def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _sanitize_action_id(raw: str, used: set) -> str:
+    """Return a click-safe action id (Mattermost web clicks hit /posts/{id}/actions/{id},
+    and that path segment MUST be letters+digits only — underscore/space silently 404s).
+    Strips every non-alnum char; on collision disambiguates with a numeric suffix
+    (safe + counter), so distinct model ids never collapse into the same click id."""
+    base = "".join(ch for ch in raw if ch.isalnum()) or "btn"
+    if base not in used:
+        return base
+    i = 2
+    while f"{base}{i}" in used:
+        i += 1
+    return f"{base}{i}"
+
+
 def _channel_id_set(raw: Any) -> set:
     """Parse a list or comma-separated string of channel IDs into a stripped set."""
     items = raw if isinstance(raw, list) else str(raw).split(",")
@@ -532,12 +546,24 @@ class MattermostAdapter(BasePlatformAdapter):
                 error="send_interactive: mixing buttons and menu is not allowed — "
                       "send either several buttons OR one select menu, not both")
         actions: List[Dict[str, Any]] = []
+        # Mattermost fires a button click at /posts/{post_id}/actions/{action_id}
+        # where action_id is actions[].id. The web app REQUIRES that id to be
+        # letters+digits only (docs: "id in the actions array may only consist of
+        # letters and numbers") — an underscore/space/etc silently kills the click
+        # (webapp 404; nothing reaches the bridge plugin). Sanitize here, keep the
+        # model-facing id in the integration context for correlation.
+        sanitize = _sanitize_action_id
+        used_ids: set = set()
         for b in buttons or []:
             bid = str(b.get("id") or "").strip()
             if not bid:
                 continue
             blabel = str(b.get("label") or bid)
-            ctx: Dict[str, Any] = {"action_id": bid, "label": blabel}
+            safe = sanitize(bid, used_ids)
+            used_ids.add(safe)
+            ctx: Dict[str, Any] = {"action_id": safe, "label": blabel}
+            if safe != bid:
+                ctx["raw_action_id"] = bid  # original asked id kept for the model
             if question_id:
                 ctx["question_id"] = question_id
             if text:
@@ -545,20 +571,24 @@ class MattermostAdapter(BasePlatformAdapter):
                 # control's context back) can tell the model WHAT this answers.
                 ctx["question"] = text
             actions.append({
-                "id": bid, "type": "button", "name": blabel,
+                "id": safe, "type": "button", "name": blabel,
                 "style": str(b.get("style") or "default"),
                 "integration": {"url": "/plugins/hermes-bridge/interact", "context": ctx},
             })
         if menu:
             mid = str(menu.get("id") or "").strip()
             if mid:
-                mctx = {"action_id": mid}
+                msafe = sanitize(mid, used_ids)
+                used_ids.add(msafe)
+                mctx = {"action_id": msafe}
+                if msafe != mid:
+                    mctx["raw_action_id"] = mid
                 if question_id:
                     mctx["question_id"] = question_id
                 if text:
                     mctx["question"] = text
                 actions.append({
-                    "id": mid, "type": "select", "name": str(menu.get("placeholder") or menu.get("name") or mid),
+                    "id": msafe, "type": "select", "name": str(menu.get("placeholder") or menu.get("name") or mid),
                     "data_source": str(menu.get("data_source") or ""),
                     "options": [
                         {"text": str(o.get("label") or o.get("value")), "value": str(o.get("value") or "")}
