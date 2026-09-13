@@ -233,21 +233,6 @@ class MattermostAdapter(BasePlatformAdapter):
         # note (no visible reply); true responds actively with a full agent turn in the thread.
         _reply_rx = (config.extra.get("reaction_reply", "") or _get_scoped_secret("MATTERMOST_REACTION_REPLY", "false"))
         self._reaction_reply: bool = str(_reply_rx).strip().lower() in {"1", "true", "yes", "on"}
-        # Collapsible progress: with the display setting ``tool_progress_grouping`` at
-        # "accumulate" (the default) the FINAL reply overwrites the live progress bubble
-        # in place (one post — progress becomes the answer) instead of posting a second
-        # message. Driven from the standard grouping knob
-        # (display.platforms.mattermost.tool_progress_grouping), not a bespoke flag;
-        # resolve_display_setting honors per-platform display overrides.
-        try:
-            from gateway.display_config import resolve_display_setting
-            from gateway.platforms.base import _config_section
-            _grouping = resolve_display_setting(
-                {"display": _config_section("display")},
-                "mattermost", "tool_progress_grouping") or "accumulate"
-        except Exception:
-            _grouping = "accumulate"
-        self._collapse_progress: bool = _grouping == "accumulate"
         # Per-channel last inbound post, so react without an explicit message_id targets the
         # conversation's own most recent message instead of (incorrectly) the home channel.
         self._last_inbound_by_chat: Dict[str, str] = {}
@@ -262,16 +247,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Cached fallback team for post search (GET /teams); resolved lazily.
         self._default_team_cache: Optional[str] = None
-        # Collapsible-progress state: a live tool/status bubble keyed by (chat_id,
-        # thread_id) that the FINAL answer overwrites in place (edit_message) instead
-        # of posting a second message. Keyed identically on the progress send and the
-        # final send, so no guessing — both carry the same thread_id in metadata.
-        self._transient_posts: Dict[Tuple[str, Optional[str]], str] = {}
-        # Post ids already collapsed into a final answer (per key). Guards the racing
-        # progress drain: a late progress-lane edit_message on a collapsed id is a no-op
-        # so it cannot overwrite the final answer. Cleaned when a fresh progress bubble
-        # starts for the same key.
-        self._finalized_transient: Dict[Tuple[str, Optional[str]], str] = {}
 
     # --- HTTP helpers ---
 
@@ -712,55 +687,14 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
-        """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post.
-
-        Collapse-progress behaviour: a non-notify send (tool/status bubble, keyed by
-        the same (chat_id, thread_id) as the eventual final reply) remembers its post
-        id; when the FINAL notify send arrives, it overwrites that bubble in place via
-        ``edit_message`` instead of posting a second message — the channel keeps ONE
-        post (progress becomes the answer). Falls back to a normal partitioned send
-        when the final is too long to edit (single runner chunk) or no progress bubble
-        is pending. The registry entry is always cleaned (pop) on the final path.
-        """
+        """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
         if not content:
             return SendResult(success=True)
-        thread_id = str(metadata.get("thread_id")) if isinstance(metadata, dict) and metadata.get("thread_id") else None
-        key = (chat_id, thread_id)
-        is_final = bool(isinstance(metadata, dict) and metadata.get("notify"))
-        collapse = self._collapse_progress
-
-        if is_final and collapse:
-            saved_id = self._transient_posts.get(key)
-            if saved_id:
-                # Overwrite the saved bubble with the FIRST runner chunk, then append
-                # any overflow as additional posts. The bubble never dangles as a
-                # half-updated progress line; it becomes the final answer.
-                chunks = self.truncate_message(self.format_message(content), MAX_POST_LENGTH)
-                result = await self.edit_message(chat_id, saved_id, chunks[0], finalize=True)
-                for chunk in chunks[1:]:
-                    result = _post_result(
-                        await self._post_message(chat_id, chunk, reply_to, metadata),
-                        "Failed to create post")
-                self._transient_posts.pop(key, None)
-                if result.success:
-                    # The bubble now carries the final answer; a late progress-lane
-                    # edit of the SAME id must be a no-op so it can't overwrite it.
-                    self._finalized_transient[key] = saved_id
-                    return result
-                # Edit/partition failed: fall through to a fresh post, but the
-                # stale bubble reference is already dropped.
         result = SendResult(success=True)
         for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
             result = _post_result(await self._post_message(chat_id, chunk, reply_to, metadata), "Failed to create post")
             if not result.success:
                 break
-        # Remember non-notify (progress/status) posts so the final reply can reclaim
-        # the bubble in collapse mode. Only the first chunk of a progressive bubble
-        # is tracked (the collapse target); a fresh key starts by clearing any
-        # finalized marker. Skipped when collapse is off so the registry stays empty.
-        if not is_final and collapse and result.success and result.message_id:
-            self._finalized_transient.pop(key, None)
-            self._transient_posts.setdefault(key, result.message_id)
         return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -776,12 +710,6 @@ class MattermostAdapter(BasePlatformAdapter):
         await self._api_post(f"users/{self._bot_user_id}/typing", {"channel_id": chat_id})
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
-        # A late progress-lane edit of a post that the final answer already collapsed
-        # into must be a no-op — otherwise the racing progress drain overwrites the
-        # delivered final reply with a stale "⚙ cmd..." status line. Same id == same
-        # bubble; no guessing.
-        if any(message_id == fid for fid in self._finalized_transient.values()):
-            return SendResult(success=True, message_id=message_id)
         payload = _with_mentions_disabled({"message": self.format_message(content)})
         return _post_result(await self._api("PUT", f"posts/{message_id}/patch", payload), "Failed to edit post")
 

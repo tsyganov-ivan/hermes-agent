@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
-from plugins.platforms.mattermost.adapter import MAX_POST_LENGTH, SendResult
 from gateway.run import (
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
@@ -262,113 +261,6 @@ class TestMattermostSend:
         assert self.adapter._api_post.call_count == 1
         payload = self.adapter._api_post.call_args_list[0][0][1]
         assert payload["root_id"] == "bad_root"
-
-    # --- Collapsible progress: final reply overwrites the progress bubble in place ---
-
-    @pytest.mark.asyncio
-    async def test_progress_send_remembers_bubble_and_final_overwrites_it(self):
-        """A tool/status bubble (no notify) is recorded; the final notify send edits that
-        same post in place instead of posting a second message, and cleans the registry."""
-        self.adapter._reply_mode = "thread"
-        self.adapter._collapse_progress = True
-        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
-        # Progress bubble post
-        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
-        progress = await self.adapter.send(
-            "channel_1", "⚙️ terminal...", metadata={"thread_id": "root_post"})
-        assert progress.success is True
-        assert progress.message_id == "progress_post_1"
-        assert self.adapter._transient_posts.get(("channel_1", "root_post")) == "progress_post_1"
-
-        # Final reply: should EDIT the bubble, not POST a new message.
-        self.adapter.edit_message = AsyncMock(
-            return_value=SendResult(success=True, message_id="progress_post_1"))
-        final = await self.adapter.send(
-            "channel_1", "Done — here is the answer.",
-            metadata={"thread_id": "root_post", "notify": True},
-        )
-
-        assert final.success is True
-        assert final.message_id == "progress_post_1"
-        self.adapter.edit_message.assert_awaited_once_with(
-            "channel_1", "progress_post_1", "Done — here is the answer.", finalize=True)
-        # No new post for the collapsed final.
-        assert self.adapter._api_post.call_count == 1
-        # Only the original progress post was created; nothing in the registry is left.
-        assert ("channel_1", "root_post") not in self.adapter._transient_posts
-        # And a late edit of the collapsed bubble is suppressed so it can't clobber the final.
-        self.adapter._api = AsyncMock(return_value={"id": "progress_post_1"})
-        late = await self.adapter.edit_message("channel_1", "progress_post_1", "⚙ stale")
-        assert late.success is True
-        self.adapter._api.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_final_without_progress_bubble_posts_normally(self):
-        """No live bubble for the key -> the final reply posts as a normal message."""
-        self.adapter._reply_mode = "thread"
-        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
-        self.adapter._api_post = AsyncMock(return_value={"id": "final_post_1"})
-
-        result = await self.adapter.send(
-            "channel_1", "Just the answer.", metadata={"thread_id": "root_post", "notify": True})
-
-        assert result.success is True
-        assert result.message_id == "final_post_1"
-        assert self.adapter._api_post.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_accumulate_mode_collapses_progress(self):
-        """'accumulate' (the default) IS collapse: a progress bubble is remembered and
-        the final reply overwrites it in place. That toggle comes from the display
-        setting, not a bespoke flag — the adapter resolves it in __init__."""
-        self.adapter._reply_mode = "thread"
-        self.adapter._collapse_progress = True  # == grouping=="accumulate"
-        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
-        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
-
-        progress = await self.adapter.send(
-            "channel_1", "⚙️ terminal...", metadata={"thread_id": "root_post"})
-
-        assert progress.success is True
-        assert self.adapter._transient_posts.get(("channel_1", "root_post")) == "progress_post_1"
-
-        self.adapter.edit_message = AsyncMock(
-            return_value=SendResult(success=True, message_id="progress_post_1"))
-        final = await self.adapter.send(
-            "channel_1", "Done.", metadata={"thread_id": "root_post", "notify": True})
-
-        assert final.message_id == "progress_post_1"
-        self.adapter.edit_message.assert_awaited_once()
-        assert ("channel_1", "root_post") not in self.adapter._transient_posts
-        # The collapsed bubble's id is retained as the finalized marker so a racing
-        # late progress-lane edit of it becomes a no-op (can't clobber the final).
-        assert self.adapter._finalized_transient.get(("channel_1", "root_post")) == "progress_post_1"
-
-    @pytest.mark.asyncio
-    async def test_final_overwrites_long_answer_and_appends_overflow(self):
-        """When the final is longer than one post, the first runner chunk edits the bubble
-        and the remaining chunks append as fresh posts."""
-        self.adapter._reply_mode = "thread"
-        self.adapter._collapse_progress = True
-        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
-        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post_1"})
-        await self.adapter.send("channel_1", "⚙️ work...", metadata={"thread_id": "root_post"})
-
-        long_answer = "x" * MAX_POST_LENGTH + "y" * 50  # spans two chunks
-        self.adapter.edit_message = AsyncMock(
-            return_value=SendResult(success=True, message_id="progress_post_1"))
-        final = await self.adapter.send(
-            "channel_1", long_answer, metadata={"thread_id": "root_post", "notify": True})
-
-        assert final.success is True
-        # First chunk edits the bubble...
-        edited_content = self.adapter.edit_message.await_args.args[2]
-        assert len(edited_content) <= MAX_POST_LENGTH
-        # ...overflow posts as a second message.
-        assert self.adapter._api_post.call_count == 2
-        assert ("channel_1", "root_post") not in self.adapter._transient_posts
-        assert self.adapter._finalized_transient.get(("channel_1", "root_post")) == "progress_post_1"
-
 
 # ---------------------------------------------------------------------------
 # WebSocket event parsing
